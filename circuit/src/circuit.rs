@@ -31,6 +31,16 @@ pub struct PreprocessedColumns<F, const D: usize> {
     /// `WitnessId(wid)` was already defined by an earlier op and this NPO occurrence is
     /// a reader, not the creator. Populated by `generate_preprocessed_columns`.
     pub dup_npo_outputs: HashMap<NpoTypeId, Vec<bool>>,
+    /// Per-`Op::Public` duplicate-output flags, aligned with the emission order of
+    /// `Op::Public` ops (== the order of `primitive[Public]`). `dup_public_outputs[k] ==
+    /// true` means the k-th Public op's output witness was ALREADY created by an earlier
+    /// creator op (the zero `Const`, or an earlier `Const`/`Public` sharing the slot via a
+    /// `connect`/`assert_zero` union). Such a Public op must NOT be a second WitnessChecks
+    /// creator — it is demoted to a READER (multiplicity −1), which both keeps the bus
+    /// balanced (exactly one creator per witness) AND soundly binds the public value to the
+    /// already-created witness (e.g. `assert_zero(public_input)` ⇒ the public value must
+    /// equal the zero constant's `0`). Populated by `generate_preprocessed_columns`.
+    pub dup_public_outputs: Vec<bool>,
     /// WitnessId.0 values for all `Op::Hint` outputs in the circuit.
     ///
     /// Used by prover preprocessors (e.g. `recompose_preprocess_impl`) to distinguish
@@ -46,6 +56,7 @@ impl<F: PartialEq, const D: usize> PartialEq for PreprocessedColumns<F, D> {
             && self.ext_reads == other.ext_reads
             && self.non_primitive == other.non_primitive
             && self.dup_npo_outputs == other.dup_npo_outputs
+            && self.dup_public_outputs == other.dup_public_outputs
             && self.hint_output_wids == other.hint_output_wids
     }
 }
@@ -59,6 +70,7 @@ impl<F: Field + Clone, const D: usize> Clone for PreprocessedColumns<F, D> {
             non_primitive: self.non_primitive.clone(),
             ext_reads: self.ext_reads.clone(),
             dup_npo_outputs: self.dup_npo_outputs.clone(),
+            dup_public_outputs: self.dup_public_outputs.clone(),
             hint_output_wids: self.hint_output_wids.clone(),
         }
     }
@@ -73,6 +85,7 @@ impl<F: Field, const D: usize> PreprocessedColumns<F, D> {
             non_primitive: NonPrimitivePreprocessedMap::new(),
             ext_reads: Vec::new(),
             dup_npo_outputs: HashMap::new(),
+            dup_public_outputs: Vec::new(),
             hint_output_wids: hashbrown::HashSet::new(),
         }
     }
@@ -299,8 +312,17 @@ impl<F: Field> Circuit<F> {
                     }
                     defined[out_idx] = true;
                 }
-                // Public: creates the output witness value. Store D-scaled out index.
-                // No ext_reads increment: Public is a creator, not a reader.
+                // Public: normally CREATES the output witness value (store D-scaled out
+                // index, no ext_reads increment). BUT if the output witness was already
+                // created by an earlier op (the zero `Const`, or another `Const`/`Public`
+                // sharing the slot through a `connect`/`assert_zero` union), this Public op
+                // would be a SECOND WitnessChecks creator of the same witness — unbalancing
+                // the bus (two `+ext_reads` sends, one set of receives). In that case demote
+                // it to a READER: increment ext_reads (it now receives once) and flag it so
+                // `get_airs_and_degrees_with_prep` writes multiplicity −1 instead of
+                // +ext_reads. The reader-receive of `(out_idx, public_value)` against the
+                // already-created `(out_idx, const_value)` soundly binds the public value to
+                // that constant (e.g. `assert_zero(public_input)` ⇒ public value == 0).
                 Op::Public { out, .. } => {
                     let idx = out.base_field_index::<F, D>();
                     preprocessed.primitive[PrimitiveOpType::Public as usize].push(idx);
@@ -308,7 +330,14 @@ impl<F: Field> Circuit<F> {
                     if out_idx >= defined.len() {
                         defined.resize(out_idx + 1, false);
                     }
-                    defined[out_idx] = true;
+                    let is_dup = defined[out_idx];
+                    preprocessed.dup_public_outputs.push(is_dup);
+                    if is_dup {
+                        // Already created elsewhere: this Public is a reader, not a creator.
+                        preprocessed.increment_ext_reads(&[*out]);
+                    } else {
+                        defined[out_idx] = true;
+                    }
                 }
                 // Unified ALU operations with selectors for operation kind.
                 //
@@ -553,6 +582,7 @@ mod tests {
                 non_primitive: HashMap::new(),
                 ext_reads: vec![0],
                 dup_npo_outputs: HashMap::new(),
+                dup_public_outputs: vec![],
                 hint_output_wids: hashbrown::HashSet::new(),
             }
         );
@@ -642,6 +672,8 @@ mod tests {
                 // ext_reads: op1 reads a=0,b=1; op2 reads a=3,b=2; op3 reads a=4,b=2
                 ext_reads: vec![1, 1, 2, 1, 1],
                 dup_npo_outputs: HashMap::new(),
+                // one Public op (out=W1), not a dup of any const → stays a creator.
+                dup_public_outputs: vec![false],
                 hint_output_wids: hashbrown::HashSet::new(),
             }
         );
@@ -689,6 +721,7 @@ mod tests {
                 //                    0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
                 ext_reads: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
                 dup_npo_outputs: HashMap::new(),
+                dup_public_outputs: vec![],
                 hint_output_wids: hashbrown::HashSet::new(),
             }
         );
@@ -745,6 +778,7 @@ mod tests {
                 // ext_reads: 0(a)=1, 1(b)=1, 2(c)=1
                 ext_reads: vec![1, 1, 1],
                 dup_npo_outputs: HashMap::new(),
+                dup_public_outputs: vec![],
                 hint_output_wids: hashbrown::HashSet::new(),
             }
         );

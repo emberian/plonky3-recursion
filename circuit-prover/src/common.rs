@@ -336,12 +336,32 @@ where
             PrimitiveOpType::Public => {
                 // Public preprocessed per op from circuit.rs: 1 value (D-scaled out_idx).
                 // Convert to [ext_mult, out_idx] pairs using ext_reads.
+                //
+                // A Public op flagged in `dup_public_outputs` shares its output witness with
+                // an earlier creator (the zero `Const`, or a `Const`/`Public` union'd to it
+                // via `connect`/`assert_zero`). It must NOT be a second WitnessChecks creator
+                // — it is a READER (multiplicity −1) that binds the public value to the
+                // already-created witness. Writing +ext_reads here instead would double-send
+                // the witness's tuple and unbalance the bus (e.g. the +779 the rotated-leaf
+                // wrap hit on the all-zero `(0,0,…)` tuple when a descriptor PI was asserted
+                // equal to the zero constant).
+                let neg_one_pub = <Val<SC>>::ZERO - <Val<SC>>::ONE;
                 let mut prep_2col: Vec<Val<SC>> = Vec::with_capacity(base_prep[idx].len() * 2);
-                for &out_idx in &base_prep[idx] {
+                for (k, &out_idx) in base_prep[idx].iter().enumerate() {
                     let out_wid =
                         (<Val<SC> as PrimeField64>::as_canonical_u64(&out_idx) as usize) / D;
-                    let n_reads = preprocessed.ext_reads.get(out_wid).copied().unwrap_or(0);
-                    prep_2col.push(<Val<SC>>::from_u32(n_reads));
+                    let is_dup = preprocessed
+                        .dup_public_outputs
+                        .get(k)
+                        .copied()
+                        .unwrap_or(false);
+                    let mult = if is_dup {
+                        neg_one_pub
+                    } else {
+                        let n_reads = preprocessed.ext_reads.get(out_wid).copied().unwrap_or(0);
+                        <Val<SC>>::from_u32(n_reads)
+                    };
+                    prep_2col.push(mult);
                     prep_2col.push(out_idx);
                 }
 
