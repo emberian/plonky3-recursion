@@ -7,7 +7,7 @@ use alloc::{format, vec};
 
 use hashbrown::HashMap;
 use p3_air::{Air as P3Air, BaseAir as P3BaseAir};
-use p3_batch_stark::CommonData;
+use p3_batch_stark::{BatchProof, CommonData};
 use p3_circuit::symbolic::ColumnsTargets;
 use p3_circuit::{CircuitBuilder, NonPrimitiveOpId};
 use p3_circuit_prover::air::{AluAir, ConstAir, PublicAir};
@@ -301,6 +301,105 @@ where
     >(
         config,
         &circuit_airs,
+        circuit,
+        &verifier_inputs.proof_targets,
+        &verifier_inputs.air_public_targets,
+        pcs_params,
+        common,
+        lookup_gadget,
+        challenger_perm_config,
+    )?;
+
+    Ok((verifier_inputs, mmcs_op_ids))
+}
+
+/// Build a recursive verifier circuit for a **native** [`p3_batch_stark::BatchProof`]
+/// (NOT the circuit-prover [`BatchStarkProof`] wrapper) over a CALLER-SUPPLIED AIR set.
+///
+/// This is the sibling of [`verify_p3_batch_proof_circuit`] for batch proofs that were
+/// produced directly by `p3_batch_stark::prove_batch` over an arbitrary `&[A]` AIR set
+/// (e.g. the dregg IR-v2 multi-table descriptor batch: main + chip + range + memory +
+/// map tables), rather than by the recursion `BatchStarkProver` over circuit-prover
+/// primitive tables. Where [`verify_p3_batch_proof_circuit`] RECONSTRUCTS its AIRs from
+/// the wrapper's `table_packing`/`rows`/`non_primitives` metadata into the fixed
+/// [`CircuitTablesAir`] enum, this entry takes the AIRs the caller proved over and runs
+/// them straight through the generic [`verify_batch_circuit`]. There are NO non-primitive
+/// circuit-prover tables here: a native batch's tables ARE its `&[A]`, so the in-circuit
+/// constraint evaluation is `A::eval_folded_circuit` for each instance.
+///
+/// `air_public_counts` is derived from the AIRs (`A::width`/`num_public_values` via the
+/// caller-supplied `air_public_values` lengths through [`BatchStarkVerifierInputsBuilder`]);
+/// the caller passes the per-instance public-value counts so the verifier circuit allocates
+/// the matching public-input targets.
+///
+/// # Returns
+/// `(inputs_builder, op_ids)` — the allocated input builder (to pack public/private values
+/// afterwards) and the MMCS op-ids that need private (Merkle sibling) data on the runner.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+pub fn verify_p3_native_batch_proof_circuit<
+    A,
+    SC: StarkGenericConfig + 'static,
+    Comm: Recursive<
+            SC::Challenge,
+            Input = <SC::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Commitment,
+        > + Clone
+        + ObservableCommitment,
+    InputProof: Recursive<SC::Challenge>,
+    OpeningProof: Recursive<SC::Challenge, Input = <SC::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Proof>,
+    LG: RecursiveLookupGadget<SC::Challenge>,
+    CP: ChallengerPermConfig,
+    const WIDTH: usize,
+    const RATE: usize,
+>(
+    config: &SC,
+    circuit: &mut CircuitBuilder<SC::Challenge>,
+    airs: &[A],
+    proof: &BatchProof<SC>,
+    pcs_params: &PcsVerifierParams<SC, InputProof, OpeningProof, Comm>,
+    common_data: &CommonData<SC>,
+    air_public_counts: &[usize],
+    lookup_gadget: &LG,
+    challenger_perm_config: CP,
+) -> Result<
+    (
+        BatchStarkVerifierInputsBuilder<SC, Comm, OpeningProof>,
+        Vec<NonPrimitiveOpId>,
+    ),
+    VerificationError,
+>
+where
+    A: RecursiveAir<Val<SC>, SC::Challenge, LG>,
+    <SC as StarkGenericConfig>::Pcs: RecursivePcs<
+            SC,
+            InputProof,
+            OpeningProof,
+            Comm,
+            <SC::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Domain,
+        >,
+    Val<SC>: PrimeField64,
+    SC::Challenge: ExtensionField<Val<SC>> + PrimeCharacteristicRing,
+    <<SC as StarkGenericConfig>::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Domain: Clone,
+{
+    if air_public_counts.len() != airs.len() {
+        return Err(VerificationError::InvalidProofShape(format!(
+            "native batch leaf-wrap: air_public_counts len {} != airs len {}",
+            air_public_counts.len(),
+            airs.len()
+        )));
+    }
+    let verifier_inputs = BatchStarkVerifierInputsBuilder::<SC, Comm, OpeningProof>::allocate(
+        circuit,
+        proof,
+        common_data,
+        air_public_counts,
+    );
+
+    let common = &verifier_inputs.common_data;
+
+    let mmcs_op_ids = verify_batch_circuit::<A, SC, Comm, InputProof, OpeningProof, LG, CP, WIDTH, RATE>(
+        config,
+        airs,
         circuit,
         &verifier_inputs.proof_targets,
         &verifier_inputs.air_public_targets,

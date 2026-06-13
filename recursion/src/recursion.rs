@@ -82,6 +82,19 @@ where
         common_data: &'a CommonData<SC>,
         table_public_inputs: Vec<Vec<Val<SC>>>,
     },
+    /// A **native** [`p3_batch_stark::BatchProof`] (NOT the circuit-prover wrapper) over a
+    /// CALLER-SUPPLIED AIR set `airs`, plus the symbolic `CommonData` and per-table public
+    /// inputs. Used to fold a batch proved directly by `p3_batch_stark::prove_batch` over an
+    /// arbitrary multi-table AIR set (e.g. dregg's IR-v2 descriptor batch) as a recursion
+    /// leaf — the leaf's in-circuit constraint evaluation is `A::eval_folded_circuit` per
+    /// instance, NOT the fixed [`crate::verifier::CircuitTablesAir`] reconstruction the
+    /// circuit-prover `BatchStark` arm performs.
+    NativeBatchStark {
+        airs: &'a [A],
+        proof: &'a p3_batch_stark::BatchProof<SC>,
+        common_data: &'a CommonData<SC>,
+        table_public_inputs: Vec<Vec<Val<SC>>>,
+    },
 }
 
 /// Output of one recursion step: the next-layer batch proof and its prover data (for chaining or verification).

@@ -32,7 +32,7 @@ use crate::recursion::{PcsRecursionBackend, RecursionInput, VerifierCircuitResul
 use crate::traits::RecursiveAir;
 use crate::verifier::{
     ObservableCommitment, VerificationError, verify_p3_batch_proof_circuit,
-    verify_p3_uni_proof_circuit,
+    verify_p3_native_batch_proof_circuit, verify_p3_uni_proof_circuit,
 };
 use crate::{ChallengerPermConfig, Recursive, RecursivePcs};
 
@@ -249,6 +249,15 @@ where
                     table_public_inputs,
                 },
             ) => Ok(builder.pack_public_values(table_public_inputs, &proof.proof, common_data)),
+            (
+                Self::BatchStark(builder, _),
+                RecursionInput::NativeBatchStark {
+                    proof,
+                    common_data,
+                    table_public_inputs,
+                    ..
+                },
+            ) => Ok(builder.pack_public_values(table_public_inputs, proof, common_data)),
             _ => Err(VerificationError::InvalidProofShape(
                 "RecursionInput variant does not match verifier result".to_string(),
             )),
@@ -265,6 +274,9 @@ where
             }
             (Self::BatchStark(builder, _), RecursionInput::BatchStark { proof, .. }) => {
                 Ok(builder.pack_private_values(&proof.proof))
+            }
+            (Self::BatchStark(builder, _), RecursionInput::NativeBatchStark { proof, .. }) => {
+                Ok(builder.pack_private_values(proof))
             }
             _ => Err(VerificationError::InvalidProofShape(
                 "RecursionInput variant does not match verifier result".to_string(),
@@ -436,6 +448,43 @@ where
                     )));
                 }
             };
+            Ok(FriVerifierResult::BatchStark(verifier_inputs, op_ids))
+        }
+        RecursionInput::NativeBatchStark {
+            airs,
+            proof,
+            common_data,
+            table_public_inputs,
+        } => {
+            // Native batch leaf-wrap: verify the caller-supplied `&[A]` AIR set directly
+            // through the generic `verify_batch_circuit` (no `CircuitTablesAir`
+            // reconstruction). Per-instance public-input counts come from the caller's
+            // `table_public_inputs` (which the same caller passes as the concrete public
+            // values at pack time), so the allocated public-input target count matches.
+            let lookup_gadget = LogUpGadget::new();
+            let air_public_counts: Vec<usize> =
+                table_public_inputs.iter().map(Vec::len).collect();
+            let (verifier_inputs, op_ids) = verify_p3_native_batch_proof_circuit::<
+                A,
+                SC,
+                SC::Commitment,
+                SC::InputProof,
+                SC::OpeningProof,
+                _,
+                _,
+                WIDTH,
+                RATE,
+            >(
+                config,
+                circuit,
+                airs,
+                proof,
+                config.pcs_verifier_params(),
+                common_data,
+                &air_public_counts,
+                &lookup_gadget,
+                backend.challenger_perm_config,
+            )?;
             Ok(FriVerifierResult::BatchStark(verifier_inputs, op_ids))
         }
     }
