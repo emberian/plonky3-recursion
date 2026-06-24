@@ -247,6 +247,7 @@ where
                     proof,
                     common_data,
                     table_public_inputs,
+                    ..
                 },
             ) => Ok(builder.pack_public_values(table_public_inputs, &proof.proof, common_data)),
             (
@@ -358,8 +359,10 @@ where
             proof,
             common_data,
             table_public_inputs: _,
+            expected_preprocessed_commit,
         } => {
             let lookup_gadget = LogUpGadget::new();
+            let expected = expected_preprocessed_commit.as_ref();
             let (verifier_inputs, op_ids) = match proof.ext_degree {
                 1 => verify_p3_batch_proof_circuit::<
                     SC,
@@ -448,6 +451,19 @@ where
                     )));
                 }
             };
+            // VK-IDENTITY PIN (lever (a)). When the caller pinned an expected running-circuit
+            // commitment, constrain the child proof's preprocessed-commitment targets to equal it,
+            // in-circuit. See `pin_preprocessed_commit` / `into_recursion_input_pinned`.
+            if let Some(expected) = expected {
+                let prep_targets = verifier_inputs
+                    .common_data
+                    .preprocessed_commit_observation_targets();
+                crate::verifier::pin_preprocessed_commit::<SC, SC::Commitment>(
+                    circuit,
+                    &prep_targets,
+                    expected,
+                )?;
+            }
             Ok(FriVerifierResult::BatchStark(verifier_inputs, op_ids))
         }
         RecursionInput::NativeBatchStark {

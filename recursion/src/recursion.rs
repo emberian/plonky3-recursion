@@ -81,6 +81,23 @@ where
         proof: &'a BatchStarkProof<SC>,
         common_data: &'a CommonData<SC>,
         table_public_inputs: Vec<Vec<Val<SC>>>,
+        /// **VK-IDENTITY PIN (in-band, lever (a)).** When `Some(commitment)`, the parent
+        /// aggregation circuit adds an in-circuit constraint that the child proof's preprocessed
+        /// commitment (its verifier-key core — the Merkle cap binding the child verifier circuit's
+        /// static op-list) EQUALS this expected commitment. The child's preprocessed commitment is
+        /// already allocated as parent-circuit public-input targets (`MerkleCapTargets`, observed in
+        /// the transcript + used for the child's preprocessed-trace FRI check), but without this pin
+        /// its VALUE is unconstrained — a from-scratch prover could fold a proof of a DIFFERENT
+        /// circuit. With the pin, the cap targets are `connect`ed to constants of `commitment`, so a
+        /// foreign-circuit child (different preprocessed commitment) makes the parent circuit UNSAT.
+        ///
+        /// This is the IVC self-verification fixed-point hook: pass the running circuit's OWN fixed
+        /// preprocessed commitment to assert "I am folding a proof produced by THE SAME running
+        /// circuit." `None` preserves the legacy (unpinned) behaviour. Ignored for the primitive
+        /// tables (which carry no preprocessed commitment); applies to the single shared preprocessed
+        /// Merkle cap the child's `CommonData` exposes.
+        expected_preprocessed_commit:
+            Option<<SC::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Commitment>,
     },
     /// A **native** [`p3_batch_stark::BatchProof`] (NOT the circuit-prover wrapper) over a
     /// CALLER-SUPPLIED AIR set `airs`, plus the symbolic `CommonData` and per-table public
@@ -106,19 +123,87 @@ impl<SC> RecursionOutput<SC>
 where
     SC: StarkGenericConfig,
 {
-    /// Convert this output into a `RecursionInput::BatchStark` for the next recursion layer.
-    /// The type parameter `A` is only used for the recursion input type; use `BatchOnly` when
-    /// chaining batch-to-batch (see [`BatchOnly`]).
+    /// The GENUINE per-table public inputs of this proof, in instance order (the same order the
+    /// in-circuit `BatchStark` verifier allocates public-input targets from
+    /// `proof.non_primitives[].public_values.len()`).
+    ///
+    /// **Lever (b): in-circuit public-input THREADING.** The primitive tables (Const / Public / Alu)
+    /// carry no public values; each non-primitive table carries its `public_values`. Threading these
+    /// as `table_public_inputs` (rather than empty vectors) makes the next aggregation layer's packed
+    /// public vector MATCH the public-input targets it allocates — so a child proof whose
+    /// non-primitive tables expose public values (e.g. an aggregation proof being RE-folded) is
+    /// re-verified with its publics bound IN-CIRCUIT, instead of leaving allocated target slots
+    /// unfilled (which over-constrains the witness solver — the `WitnessConflict` the empty-vector
+    /// path trips when re-folding a proof that itself contains a fold).
+    pub fn genuine_table_public_inputs(&self) -> Vec<Vec<Val<SC>>> {
+        let num_primitive =
+            p3_circuit_prover::batch_stark_prover::NUM_PRIMITIVE_TABLES;
+        let mut tpi: Vec<Vec<Val<SC>>> = vec![vec![]; num_primitive];
+        for entry in &self.0.non_primitives {
+            tpi.push(entry.public_values.clone());
+        }
+        debug_assert_eq!(
+            tpi.len(),
+            self.0.proof.opened_values.instances.len(),
+            "table_public_inputs must have one entry per proof instance"
+        );
+        tpi
+    }
+
+    /// Convert this output into a `RecursionInput::BatchStark` for the next recursion layer, THREADING
+    /// this proof's genuine per-table public inputs (lever (b)) so they are re-verified in-circuit at
+    /// the next layer. The type parameter `A` is only used for the recursion input type; use
+    /// `BatchOnly` when chaining batch-to-batch (see [`BatchOnly`]).
     pub fn into_recursion_input<A>(&self) -> RecursionInput<'_, SC, A>
     where
         A: RecursiveAir<Val<SC>, SC::Challenge, LogUpGadget>,
     {
-        let num_tables = self.0.proof.opened_values.instances.len();
         RecursionInput::BatchStark {
             proof: &self.0,
             common_data: &self.0.stark_common,
-            table_public_inputs: vec![vec![]; num_tables],
+            table_public_inputs: self.genuine_table_public_inputs(),
+            expected_preprocessed_commit: None,
         }
+    }
+
+    /// Like [`into_recursion_input`](Self::into_recursion_input), but PINS the child's VK identity
+    /// in-band (lever (a)): the parent aggregation circuit will constrain the child proof's
+    /// preprocessed commitment to equal `expected_preprocessed_commit`.
+    ///
+    /// Pass the running circuit's OWN fixed preprocessed commitment to assert the IVC
+    /// self-verification fixed-point ("I fold a proof from the SAME running circuit"). A child whose
+    /// preprocessed commitment differs (a proof of a different circuit) makes the parent UNSAT.
+    ///
+    /// Obtain the expected commitment from a reference running proof via
+    /// [`running_preprocessed_commit`](Self::running_preprocessed_commit).
+    pub fn into_recursion_input_pinned<A>(
+        &self,
+        expected_preprocessed_commit: <SC::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Commitment,
+    ) -> RecursionInput<'_, SC, A>
+    where
+        A: RecursiveAir<Val<SC>, SC::Challenge, LogUpGadget>,
+    {
+        RecursionInput::BatchStark {
+            proof: &self.0,
+            common_data: &self.0.stark_common,
+            table_public_inputs: self.genuine_table_public_inputs(),
+            expected_preprocessed_commit: Some(expected_preprocessed_commit),
+        }
+    }
+
+    /// The child proof's preprocessed commitment (its VK-identity core), if it has preprocessed
+    /// columns. This is the value to pin across an IVC fold: extract it ONCE from the running
+    /// circuit's reference proof, then pass it to
+    /// [`into_recursion_input_pinned`](Self::into_recursion_input_pinned) at every fold step to
+    /// assert the running circuit's identity stays constant.
+    pub fn running_preprocessed_commit(
+        &self,
+    ) -> Option<<SC::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Commitment> {
+        self.0
+            .stark_common
+            .preprocessed
+            .as_ref()
+            .map(|gp| gp.commitment.clone())
     }
 }
 

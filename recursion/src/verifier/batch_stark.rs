@@ -173,6 +173,49 @@ fn binomial_w_for_alu<F: Field, EF: ExtensionField<F> + ExtractBinomialW<F>>() -
     EF::extract_w().expect("extension field must provide binomial W for ALU AIR")
 }
 
+/// **Pin a child proof's VK identity in-band (lever (a)).**
+///
+/// Given the already-allocated preprocessed-commitment cap targets of a child batch proof (from
+/// [`CommonDataTargets::preprocessed_commit_observation_targets`]) and the `expected` commitment
+/// value, add an in-circuit constraint that each cap target EQUALS a constant of the expected value.
+///
+/// The child's preprocessed commitment is its verifier-key core (the Merkle cap binding the child
+/// verifier circuit's static op-list). It is allocated as parent-circuit public inputs and consumed
+/// by the child's preprocessed-trace FRI check, but its VALUE is otherwise unconstrained — a
+/// from-scratch prover could fold a proof of a DIFFERENT circuit. Connecting the targets to the
+/// expected constants pins the child's identity: a foreign-circuit child (different preprocessed
+/// commitment) makes the parent circuit UNSAT. This is the IVC self-verification fixed-point hook —
+/// pass the running circuit's OWN fixed preprocessed commitment to assert "I fold a proof from THE
+/// SAME running circuit," so the running VK fingerprint is constant across the fold.
+///
+/// `Comm::get_values(expected)` yields the expected commitment's field elements in the SAME flat
+/// order as [`ObservableCommitment::to_observation_targets`], so the i-th expected value pins the
+/// i-th target. Errors if the lengths differ (a structurally different child commitment).
+pub fn pin_preprocessed_commit<SC, Comm>(
+    circuit: &mut CircuitBuilder<SC::Challenge>,
+    prep_targets: &[Target],
+    expected: &Comm::Input,
+) -> Result<(), VerificationError>
+where
+    SC: StarkGenericConfig,
+    Comm: Recursive<SC::Challenge>,
+{
+    let expected_vals = Comm::get_values(expected);
+    if prep_targets.len() != expected_vals.len() {
+        return Err(VerificationError::InvalidProofShape(format!(
+            "VK-identity pin: expected preprocessed commitment has {} elements but the child \
+             proof's allocated commitment has {} (a different-shaped circuit — refusing the fold)",
+            expected_vals.len(),
+            prep_targets.len()
+        )));
+    }
+    for (&target, &val) in prep_targets.iter().zip(expected_vals.iter()) {
+        let expected_const = circuit.alloc_const(val, "VK-identity pin (expected child VK cap)");
+        circuit.connect(target, expected_const);
+    }
+    Ok(())
+}
+
 /// Build and attach a recursive verifier circuit for a circuit-prover [`BatchStarkProof`].
 ///
 /// This reconstructs the circuit table AIRs from the proof metadata (rows + packing) so callers

@@ -15,6 +15,7 @@ use p3_uni_stark::{OpenedValues, Proof, StarkGenericConfig, Val};
 
 use crate::Target;
 use crate::traits::{Recursive, RecursiveChallenger};
+use crate::verifier::ObservableCommitment;
 
 /// Structure representing all the targets necessary for an input proof.
 ///
@@ -153,6 +154,26 @@ pub struct CommonDataTargets<SC: StarkGenericConfig, Comm> {
     pub(crate) preprocessed: Option<GlobalPreprocessedTargets<Comm>>,
     /// Lookup data
     pub lookups: Vec<Vec<Lookup<Val<SC>>>>,
+}
+
+impl<SC: StarkGenericConfig, Comm> CommonDataTargets<SC, Comm> {
+    /// The allocated preprocessed-commitment cap targets in canonical (`to_observation_targets`)
+    /// order, or empty if this batch has no preprocessed columns.
+    ///
+    /// These targets are the child proof's VK-identity core inside the parent aggregation circuit
+    /// (the Merkle cap binding the child verifier circuit's static op-list). They are observed in
+    /// the transcript and consumed by the preprocessed-trace FRI check, but their VALUE is otherwise
+    /// unconstrained — exposing them here lets the caller pin them to an expected commitment for the
+    /// IVC self-verification fixed-point (lever (a); see [`crate::pin_preprocessed_commit`]).
+    pub fn preprocessed_commit_observation_targets(&self) -> Vec<crate::Target>
+    where
+        Comm: ObservableCommitment,
+    {
+        self.preprocessed
+            .as_ref()
+            .map(|gp| gp.commitment.to_observation_targets())
+            .unwrap_or_default()
+    }
 }
 
 impl<SC: StarkGenericConfig, Comm> Recursive<SC::Challenge> for CommonDataTargets<SC, Comm>
