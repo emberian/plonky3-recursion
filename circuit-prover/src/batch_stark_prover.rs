@@ -1406,6 +1406,37 @@ where
         w_binomial: Option<Val<SC>>,
         common: &CommonData<SC>,
     ) -> Result<(), BatchStarkProverError> {
+        let (airs, pvs, effective_common) =
+            self.rebuild_airs_pvs_common::<D>(proof, w_binomial, common)?;
+        p3_batch_stark::verify_batch(&self.config, &airs, &proof.proof, &pvs, &effective_common)
+            .map_err(|e| BatchStarkProverError::Verify(format!("{e:?}")))
+    }
+
+    /// Rebuild the verifiable `CommonData` (with lookup contexts derived from the
+    /// proof-reconstructed AIRs) for a (possibly deserialized) proof. The serialized
+    /// `stark_common` only carries the preprocessed binding; the in-circuit recursion
+    /// verifier (`verify_p3_batch_proof_circuit`) needs the lookup contexts, which this
+    /// reconstructs EXACTLY as `verify::<D>` does (same AIR order, same lane counts).
+    pub fn rebuild_verifiable_common<const D: usize>(
+        &self,
+        proof: &BatchStarkProof<SC>,
+        w_binomial: Option<Val<SC>>,
+    ) -> Result<CommonData<SC>, BatchStarkProverError> {
+        let (_airs, _pvs, effective_common) =
+            self.rebuild_airs_pvs_common::<D>(proof, w_binomial, &proof.stark_common)?;
+        Ok(effective_common)
+    }
+
+    /// Shared AIR/lookup/common reconstruction used by both `verify` and
+    /// `rebuild_verifiable_common`.
+    #[allow(clippy::type_complexity)]
+    fn rebuild_airs_pvs_common<const D: usize>(
+        &self,
+        proof: &BatchStarkProof<SC>,
+        w_binomial: Option<Val<SC>>,
+        common: &CommonData<SC>,
+    ) -> Result<(Vec<CircuitTableAir<SC, D>>, Vec<Vec<Val<SC>>>, CommonData<SC>), BatchStarkProverError>
+    {
         let prover_index_by_type: BTreeMap<NpoTypeId, usize> = self
             .non_primitive_provers
             .iter()
@@ -1487,8 +1518,7 @@ where
             lookups,
         );
 
-        p3_batch_stark::verify_batch(&self.config, &airs, &proof.proof, &pvs, &effective_common)
-            .map_err(|e| BatchStarkProverError::Verify(format!("{e:?}")))
+        Ok((airs, pvs, effective_common))
     }
 }
 
