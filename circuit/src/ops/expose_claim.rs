@@ -30,10 +30,23 @@ use crate::types::{ExprId, WitnessId};
 pub(crate) struct ExposeClaimConfig;
 
 /// Per-row data captured during execution: which witness was read and its value.
+///
+/// `value` is the host-exposed scalar (coeff-0 of the read cell). `read_coeffs`
+/// holds ALL `D` base-field coefficients of the read witness — the table's main
+/// trace must reproduce the FULL witness value so the `WitnessChecks` receive
+/// tuple `[idx, c_0, ..., c_{D-1}]` exactly matches the tuple the witness's
+/// CREATOR sent (e.g. a W24 Poseidon2 output limb, whose higher coefficients are
+/// genuinely nonzero). Binding only coeff-0 and zeroing the rest would read a
+/// DIFFERENT tuple than the creator sent, unbalancing the global lookup bus.
+///
+/// On the execution-state rows `F` is the circuit extension field and `read_coeffs`
+/// is left empty (the trace generator derives it); on the base-field trace rows it
+/// is populated with the `D` coefficients.
 #[derive(Debug, Clone)]
 pub struct ExposeClaimCircuitRow<F> {
     pub witness_id: WitnessId,
     pub value: F,
+    pub read_coeffs: alloc::vec::Vec<F>,
 }
 
 /// Execution state collecting the exposed claim rows (in lane order).
@@ -83,6 +96,7 @@ impl<F: Field + Send + Sync + 'static> NonPrimitiveExecutor<F> for ExposeClaimEx
             rows.push(ExposeClaimCircuitRow {
                 witness_id: wid,
                 value,
+                read_coeffs: alloc::vec::Vec::new(),
             });
         }
 
@@ -253,10 +267,17 @@ where
         .rows
         .iter()
         .map(|row| {
+            // Capture ALL `D` base-field coefficients of the read witness. The host
+            // value exposed is coeff-0, but the table's `WitnessChecks` receive must
+            // carry the FULL witness tuple so it matches the tuple the witness's
+            // creator sent (a base-field witness has zero higher coeffs; a Poseidon2
+            // output limb carries 4 genuinely-nonzero base lanes packed as one ext
+            // element). See `ExposeClaimCircuitRow` for why.
             let coeffs = row.value.as_basis_coefficients_slice();
             ExposeClaimCircuitRow {
                 witness_id: row.witness_id,
                 value: coeffs[0],
+                read_coeffs: coeffs.to_vec(),
             }
         })
         .collect();

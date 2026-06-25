@@ -152,17 +152,21 @@ fn replay_one(path: &std::path::Path) -> Result<(), VerificationError> {
         .rebuild_verifiable_common::<D>(&proof, proof.w_binomial)
         .expect("rebuild verifiable common");
 
-    // Sanity: does NATIVE accept this frozen proof? (The recursion must match native.)
-    match np_prover.verify_all_tables(&proof) {
-        Ok(()) => eprintln!(
-            "[frozen-replay] {:?}: NATIVE verify_all_tables ACCEPTS",
-            path.file_name().unwrap()
-        ),
-        Err(e) => eprintln!(
-            "[frozen-replay] {:?}: NATIVE verify_all_tables REJECTS: {e:?}",
-            path.file_name().unwrap()
-        ),
-    }
+    // NATIVE must accept this frozen child: its WitnessChecks global cumulative balances
+    // to zero (the W24 segment-digest / expose_claim bus fix). A REJECT here is the
+    // regression this oracle guards.
+    np_prover
+        .verify_all_tables(&proof)
+        .unwrap_or_else(|e| {
+            panic!(
+                "[frozen-replay] {:?}: NATIVE verify_all_tables REJECTED (bus regression): {e:?}",
+                path.file_name().unwrap()
+            )
+        });
+    eprintln!(
+        "[frozen-replay] {:?}: NATIVE verify_all_tables ACCEPTS",
+        path.file_name().unwrap()
+    );
 
     let mut cb = CircuitBuilder::new();
     enable_dregg_tables(&mut cb);
@@ -267,22 +271,22 @@ fn frozen_agg_children_replay() {
         return;
     }
 
-    let mut any_conflict = false;
+    let mut conflicts: Vec<String> = Vec::new();
     for path in &children {
-        let r = replay_one(path);
-        match &r {
-            Ok(()) => eprintln!("[frozen-replay] {:?}: OK", path.file_name().unwrap()),
+        match replay_one(path) {
+            Ok(()) => eprintln!("[frozen-replay] {:?}: OK (clean replay)", path.file_name().unwrap()),
             Err(e) => {
-                any_conflict = true;
-                eprintln!("[frozen-replay] {:?}: CONFLICT/ERR: {e:?}", path.file_name().unwrap());
+                let msg = format!("{:?}: {e:?}", path.file_name().unwrap());
+                eprintln!("[frozen-replay] CONFLICT/ERR: {msg}");
+                conflicts.push(msg);
             }
         }
     }
-    // Once the bucketing fix lands, NO child conflicts (flip the assertion's polarity
-    // to a clean-replay guard at that point).
+    // The W24 segment-digest / expose_claim WitnessChecks bus now balances, so EVERY frozen
+    // child must replay cleanly (no height-1 WitnessConflict) AND native verify_all_tables
+    // (asserted inside `replay_one`) must accept. A conflict here is the bus regression.
     assert!(
-        any_conflict,
-        "expected at least one frozen aggregation child to reproduce the height-1 \
-         WitnessConflict (the residual). If none did, the bug is fixed — flip this assert."
+        conflicts.is_empty(),
+        "frozen aggregation children must replay cleanly (bus balances); got conflicts: {conflicts:?}"
     );
 }

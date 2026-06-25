@@ -1638,6 +1638,80 @@ where
         Ok(output_exprs)
     }
 
+    /// One step of a full-state duplex SPONGE over a Poseidon2 permutation, with the
+    /// CAPACITY chained OFF the `WitnessChecks` bus.
+    ///
+    /// This is the bus-balanced way to chain a multi-permutation sponge (e.g. the IVC
+    /// segment-digest). Feeding the full previous output state (rate + capacity) as fresh
+    /// CTL-verified inputs to each independent (`new_start = true`) permutation does NOT
+    /// balance: a permutation only CTL-SENDS its `rate_ext` rate outputs, so the next
+    /// permutation's capacity-input RECEIVE has no matching send. Instead, this method:
+    ///
+    /// - CTL-binds only the `rate_ext` rate inputs (`rate_in`);
+    /// - on the FIRST step (`new_start = true`) CTL-binds the `width_ext - rate_ext`
+    ///   capacity IV limbs (`capacity_seed`), keeping the bus balanced against their
+    ///   creator (a `Const`/`Public`/perm output);
+    /// - on subsequent steps (`new_start = false`) leaves the capacity inputs absent, so
+    ///   the AIR's chain constraint inherits the previous perm row's capacity OUTPUT
+    ///   (sound, and entirely OFF the bus — no send/receive for the capacity).
+    ///
+    /// Returns the `rate_ext` rate-limb outputs (the squeezable state). The capacity output
+    /// is intentionally not returned: it lives only in the chain. The permutation result is
+    /// byte-identical to feeding the full state (the AIR computes over the same rate +
+    /// inherited-capacity), so a sponge built from these steps yields the SAME digest as a
+    /// native full-state sponge — it only differs in the (off-bus) capacity bookkeeping.
+    ///
+    /// Steps that share a chain MUST be consecutive rows in the permutation table (i.e. no
+    /// other permutation of the same config interleaved), which holds when a single
+    /// `seg`-style sponge emits its steps back-to-back.
+    pub fn add_poseidon2_perm_sponge_step(
+        &mut self,
+        config: crate::ops::Poseidon2Config,
+        new_start: bool,
+        rate_in: &[ExprId],
+        capacity_seed: &[ExprId],
+    ) -> Result<Vec<ExprId>, CircuitBuilderError> {
+        self.push_scope("poseidon2_perm_sponge_step");
+
+        let width_ext = config.width_ext();
+        let rate_ext = config.rate_ext();
+        let cap_ext = width_ext - rate_ext;
+        if rate_in.len() != rate_ext {
+            return Err(CircuitBuilderError::MissingOutput);
+        }
+        if new_start && capacity_seed.len() != cap_ext {
+            return Err(CircuitBuilderError::MissingOutput);
+        }
+
+        let mut inputs: Vec<Option<ExprId>> = Vec::with_capacity(width_ext);
+        for &r in rate_in.iter().take(rate_ext) {
+            inputs.push(Some(r));
+        }
+        for i in 0..cap_ext {
+            // First step: seed + CTL-bind the capacity IV. Chained steps: absent input, so
+            // the AIR inherits the previous row's capacity (off-bus).
+            inputs.push(if new_start { Some(capacity_seed[i]) } else { None });
+        }
+
+        let (_op_id, outputs) = self.add_poseidon2_perm(&Poseidon2PermCall {
+            config,
+            new_start,
+            merkle_path: false,
+            mmcs_bit: None,
+            inputs,
+            out_ctl: vec![true; rate_ext],
+            return_all_outputs: false,
+            mmcs_index_sum: None,
+        })?;
+
+        let rate_out: Vec<ExprId> = (0..rate_ext)
+            .map(|i| outputs[i].ok_or(CircuitBuilderError::MissingOutput))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.pop_scope();
+        Ok(rate_out)
+    }
+
     /// Applies Poseidon2 permutation for the circuit challenger (base field, D=1).
     ///
     /// Takes 16 base field element inputs and returns 16 base field element outputs.

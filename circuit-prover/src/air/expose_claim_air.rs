@@ -93,8 +93,19 @@ impl<F: Field + PrimeCharacteristicRing, const D: usize> ExposeClaimAir<F, D> {
 
         let mut values = F::zero_vec(row_width);
         for (lane, row) in rows.iter().enumerate() {
-            // Base-field claim embedded as (value, 0, ..., 0).
-            values[lane * lane_w] = row.value;
+            // Reproduce the FULL witness value (all `D` coefficients), so the
+            // `WitnessChecks` receive tuple matches the tuple the creator sent. A
+            // base-field witness contributes `(value, 0, ..., 0)`; a Poseidon2 output
+            // limb contributes its 4 genuinely-nonzero base lanes. (`read_coeffs` is
+            // populated by the trace generator; empty only on degenerate rows, where
+            // we fall back to the coeff-0 embedding.)
+            if row.read_coeffs.is_empty() {
+                values[lane * lane_w] = row.value;
+            } else {
+                for (j, &c) in row.read_coeffs.iter().take(lane_w).enumerate() {
+                    values[lane * lane_w + j] = c;
+                }
+            }
         }
 
         let mut mat = RowMajorMatrix::new(values, row_width);
@@ -172,18 +183,19 @@ where
             // main columns) do not force the nonzero public value to zero.
             let active: AB::Expr = AB::Expr::ZERO - read_mult;
 
-            // Bind the table's public value to the value read off the bus:
-            // `active * (public_value[lane] - v_0) == 0`.
+            // Bind the table's host-exposed public value to coeff-0 of the value
+            // read off the bus: `active * (public_value[lane] - v_0) == 0`.
+            //
+            // The higher coefficients `v_1..v_{D-1}` are NOT constrained to zero: the
+            // read cell carries the FULL witness value so its `WitnessChecks` receive
+            // tuple matches the tuple the creating table sent (a Poseidon2 output limb
+            // packs 4 genuinely-nonzero base lanes into one ext element; forcing them
+            // to zero here would receive a different tuple than was sent, unbalancing
+            // the global bus). Only coeff-0 is exposed as the host-readable claim, and
+            // it is bus-bound to the genuine witness — which is the soundness property.
             let pv: AB::Expr = pis[lane].into();
             let v0: AB::Expr = main_local[main_off].into();
             builder.assert_zero(active.clone() * (pv - v0));
-
-            // The exposed claims are base-field scalars: the higher coefficients
-            // of the read EF cell must be zero (gated to active lanes).
-            for j in 1..D {
-                let vj: AB::Expr = main_local[main_off + j].into();
-                builder.assert_zero(active.clone() * vj);
-            }
         }
     }
 }
