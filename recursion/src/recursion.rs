@@ -233,6 +233,15 @@ where
 
     /// Operation IDs that require private data (e.g. Merkle paths) for the circuit runner.
     fn op_ids(&self) -> &[NonPrimitiveOpId];
+
+    /// Per-instance public-input targets allocated for this verified child.
+    ///
+    /// `air_public_targets()[i]` is the list of public-input targets for the
+    /// child's instance `i` (primitive tables first, then non-primitive tables
+    /// in proof order). These are exactly the values bound to the child proof by
+    /// the in-circuit verifier, so re-exposing them carries a claim up a layer.
+    /// A `UniStark` child returns a single instance.
+    fn air_public_targets(&self) -> Vec<Vec<crate::Target>>;
 }
 
 /// PCS-specific backend for building verifier circuits and setting private data.
@@ -375,11 +384,46 @@ where
     SymbolicExpressionExt<Val<SC>, SC::Challenge>:
         Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
 {
+    build_next_layer_circuit_with_expose::<SC, A, B, D>(prev, config, backend, None)
+}
+
+/// Hook invoked after a single child's verifier constraints are built (and
+/// before the circuit is finalized), receiving that child's per-instance
+/// `air_public_targets`. Used to re-expose chain claims at a leaf wrap.
+pub type NextLayerExposeHook<'a, F> = &'a dyn Fn(&mut CircuitBuilder<F>, &[Vec<crate::Target>]);
+
+/// Like [`build_next_layer_circuit`], but invokes `expose` (if any) on the
+/// builder after the child verifier constraints are emitted, so the caller can
+/// add an exposed-claim table over the child's `air_public_targets`.
+pub fn build_next_layer_circuit_with_expose<SC, A, B, const D: usize>(
+    prev: &RecursionInput<'_, SC, A>,
+    config: &SC,
+    backend: &B,
+    expose: Option<NextLayerExposeHook<'_, SC::Challenge>>,
+) -> Result<(Circuit<SC::Challenge>, B::VerifierResult), VerificationError>
+where
+    SC: StarkGenericConfig + Send + Sync + Clone + 'static,
+    A: RecursiveAir<Val<SC>, SC::Challenge, LogUpGadget>,
+    B: PcsRecursionBackend<SC, A, D>,
+    Val<SC>: PrimeField64 + StarkField,
+    SC::Challenge: BasedVectorSpace<Val<SC>>
+        + From<Val<SC>>
+        + ExtensionField<Val<SC>>
+        + ExtractBinomialW<Val<SC>>,
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>:
+        Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
+{
     let mut circuit_builder = CircuitBuilder::new();
     backend.prepare_circuit(config, &mut circuit_builder)?;
 
     // Build verifier constraints.
     let verifier_result = backend.build_verifier_circuit(prev, config, &mut circuit_builder)?;
+
+    if let Some(expose) = expose {
+        let apt = verifier_result.air_public_targets();
+        expose(&mut circuit_builder, &apt);
+    }
+
     let verification_circuit = circuit_builder
         .build()
         .map_err(VerificationError::CircuitBuilder)?;
@@ -581,8 +625,32 @@ where
     SymbolicExpressionExt<Val<SC>, SC::Challenge>:
         Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
 {
+    build_and_prove_next_layer_with_expose::<SC, A, B, D>(prev, config, backend, params, None)
+}
+
+/// Like [`build_and_prove_next_layer`], but with an [`NextLayerExposeHook`] that
+/// can add an exposed-claim table over the verified child's `air_public_targets`.
+pub fn build_and_prove_next_layer_with_expose<SC, A, B, const D: usize>(
+    prev: &RecursionInput<'_, SC, A>,
+    config: &SC,
+    backend: &B,
+    params: &ProveNextLayerParams,
+    expose: Option<NextLayerExposeHook<'_, SC::Challenge>>,
+) -> Result<RecursionOutput<SC>, VerificationError>
+where
+    SC: StarkGenericConfig + Send + Sync + Clone + 'static,
+    A: RecursiveAir<Val<SC>, SC::Challenge, LogUpGadget>,
+    B: PcsRecursionBackend<SC, A, D>,
+    Val<SC>: PrimeField64 + StarkField,
+    SC::Challenge: BasedVectorSpace<Val<SC>>
+        + From<Val<SC>>
+        + ExtensionField<Val<SC>>
+        + ExtractBinomialW<Val<SC>>,
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>:
+        Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
+{
     let (verification_circuit, verifier_result) =
-        build_next_layer_circuit::<SC, A, B, D>(prev, config, backend)?;
+        build_next_layer_circuit_with_expose::<SC, A, B, D>(prev, config, backend, expose)?;
 
     prove_next_layer::<SC, A, B, D>(
         prev,
@@ -601,11 +669,57 @@ where
 /// and one `BatchStark` right) or identical ones.
 #[instrument(skip_all)]
 #[allow(clippy::type_complexity)]
+#[allow(dead_code, clippy::type_complexity)]
 fn build_aggregation_layer_circuit<SC, A1, A2, B, const D: usize>(
     left: &RecursionInput<'_, SC, A1>,
     right: &RecursionInput<'_, SC, A2>,
     config: &SC,
     backend: &B,
+) -> Result<
+    (
+        Circuit<SC::Challenge>,
+        (
+            <B as PcsRecursionBackend<SC, A1, D>>::VerifierResult, // left
+            <B as PcsRecursionBackend<SC, A2, D>>::VerifierResult, // right
+        ),
+    ),
+    VerificationError,
+>
+where
+    SC: StarkGenericConfig + Send + Sync + Clone + 'static,
+    A1: RecursiveAir<Val<SC>, SC::Challenge, LogUpGadget>,
+    A2: RecursiveAir<Val<SC>, SC::Challenge, LogUpGadget>,
+    B: PcsRecursionBackend<SC, A1, D> + PcsRecursionBackend<SC, A2, D>,
+    Val<SC>: PrimeField64 + StarkField,
+    SC::Challenge: BasedVectorSpace<Val<SC>>
+        + From<Val<SC>>
+        + ExtensionField<Val<SC>>
+        + ExtractBinomialW<Val<SC>>,
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>:
+        Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
+{
+    build_aggregation_layer_circuit_with_expose::<SC, A1, A2, B, D>(
+        left, right, config, backend, None,
+    )
+}
+
+/// Hook invoked after both children's verifier constraints are built (and before
+/// the aggregation circuit is finalized), receiving the LEFT and RIGHT children's
+/// per-instance `air_public_targets`. Used to re-expose + connect-bind chain
+/// claims one layer up the fold.
+pub type AggExposeHook<'a, F> =
+    &'a dyn Fn(&mut CircuitBuilder<F>, &[Vec<crate::Target>], &[Vec<crate::Target>]);
+
+/// Like [`build_aggregation_layer_circuit`], but invokes `expose` (if any) on the
+/// builder after both child verifiers are emitted, receiving the left and right
+/// `air_public_targets`.
+#[allow(clippy::type_complexity)]
+fn build_aggregation_layer_circuit_with_expose<SC, A1, A2, B, const D: usize>(
+    left: &RecursionInput<'_, SC, A1>,
+    right: &RecursionInput<'_, SC, A2>,
+    config: &SC,
+    backend: &B,
+    expose: Option<AggExposeHook<'_, SC::Challenge>>,
 ) -> Result<
     (
         Circuit<SC::Challenge>,
@@ -638,6 +752,12 @@ where
     let left_result = backend.build_verifier_circuit(left, config, &mut circuit_builder)?;
     // Build right verifier constraints into the same builder.
     let right_result = backend.build_verifier_circuit(right, config, &mut circuit_builder)?;
+
+    if let Some(expose) = expose {
+        let left_apt = left_result.air_public_targets();
+        let right_apt = right_result.air_public_targets();
+        expose(&mut circuit_builder, &left_apt, &right_apt);
+    }
 
     let verification_circuit = circuit_builder
         .build()
@@ -851,8 +971,40 @@ where
     SymbolicExpressionExt<Val<SC>, SC::Challenge>:
         Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
 {
+    build_and_prove_aggregation_layer_with_expose::<SC, A1, A2, B, D>(
+        left, right, config, backend, params, prep_cache, None,
+    )
+}
+
+/// Like [`build_and_prove_aggregation_layer`], but with an [`AggExposeHook`] that
+/// can re-expose + connect-bind chain claims one layer up the fold.
+#[allow(clippy::too_many_arguments)]
+pub fn build_and_prove_aggregation_layer_with_expose<SC, A1, A2, B, const D: usize>(
+    left: &RecursionInput<'_, SC, A1>,
+    right: &RecursionInput<'_, SC, A2>,
+    config: &SC,
+    backend: &B,
+    params: &ProveNextLayerParams,
+    prep_cache: Option<&mut Option<AggregationPrepCache<SC>>>,
+    expose: Option<AggExposeHook<'_, SC::Challenge>>,
+) -> Result<RecursionOutput<SC>, VerificationError>
+where
+    SC: StarkGenericConfig + Send + Sync + Clone + 'static,
+    A1: RecursiveAir<Val<SC>, SC::Challenge, LogUpGadget>,
+    A2: RecursiveAir<Val<SC>, SC::Challenge, LogUpGadget>,
+    B: PcsRecursionBackend<SC, A1, D> + PcsRecursionBackend<SC, A2, D>,
+    Val<SC>: PrimeField64 + StarkField,
+    SC::Challenge: BasedVectorSpace<Val<SC>>
+        + From<Val<SC>>
+        + ExtensionField<Val<SC>>
+        + ExtractBinomialW<Val<SC>>,
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>:
+        Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
+{
     let (verification_circuit, (left_result, right_result)) =
-        build_aggregation_layer_circuit::<SC, A1, A2, B, D>(left, right, config, backend)?;
+        build_aggregation_layer_circuit_with_expose::<SC, A1, A2, B, D>(
+            left, right, config, backend, expose,
+        )?;
 
     prove_aggregation_layer::<SC, A1, A2, B, D>(
         left,

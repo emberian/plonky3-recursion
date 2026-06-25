@@ -18,6 +18,7 @@ pub enum NonPrimitiveOpParams<F> {
     Poseidon1Perm { new_start: bool, merkle_path: bool },
     Unconstrained { executor: Box<dyn HintExecutor<F>> },
     Recompose,
+    ExposeClaim,
 }
 
 impl<F> NonPrimitiveOpParams<F> {
@@ -70,6 +71,7 @@ impl<F: Field> Clone for NonPrimitiveOpParams<F> {
                 executor: executor.boxed(),
             },
             Self::Recompose => Self::Recompose,
+            Self::ExposeClaim => Self::ExposeClaim,
         }
     }
 }

@@ -7,6 +7,7 @@ use alloc::{format, vec};
 
 use p3_circuit::{CircuitBuilder, CircuitRunner, NonPrimitiveOpId};
 use p3_circuit_prover::batch_stark_prover::{
+    expose_claim_air_builders, expose_claim_preprocessor, expose_claim_table_provers,
     poseidon1_air_builders, poseidon1_air_builders_d5, poseidon1_preprocessor,
     poseidon1_table_provers_d5, poseidon2_air_builders, poseidon2_air_builders_d5,
     poseidon2_preprocessor, poseidon2_table_provers_d5, recompose_air_builders,
@@ -16,9 +17,9 @@ use p3_circuit_prover::common::{NpoAirBuilder, NpoPreprocessor};
 use p3_circuit_prover::config::StarkField;
 use p3_circuit_prover::field_params::ExtractBinomialW;
 use p3_circuit_prover::{
-    ConstraintProfile, Poseidon1Preprocessor, Poseidon1Prover, Poseidon1ProverD2,
-    Poseidon2Preprocessor, Poseidon2Prover, Poseidon2ProverD2, RecomposePreprocessor, TableProver,
-    recompose_table_provers,
+    ConstraintProfile, ExposeClaimPreprocessor, Poseidon1Preprocessor, Poseidon1Prover,
+    Poseidon1ProverD2, Poseidon2Preprocessor, Poseidon2Prover, Poseidon2ProverD2,
+    RecomposePreprocessor, TableProver, recompose_table_provers,
 };
 use p3_commit::Pcs;
 use p3_field::extension::BinomiallyExtendable;
@@ -290,6 +291,13 @@ where
             Self::UniStark(_, ids) | Self::BatchStark(_, ids) => ids,
         }
     }
+
+    fn air_public_targets(&self) -> Vec<Vec<crate::Target>> {
+        match self {
+            Self::UniStark(b, _) => vec![b.air_public_targets.clone()],
+            Self::BatchStark(b, _) => b.air_public_targets.clone(),
+        }
+    }
 }
 
 fn build_verifier_circuit_impl<SC, A, const WIDTH: usize, const RATE: usize, C>(
@@ -516,6 +524,7 @@ where
     Poseidon1Preprocessor: NpoPreprocessor<Val<SC>>,
     Poseidon2Preprocessor: NpoPreprocessor<Val<SC>>,
     RecomposePreprocessor: NpoPreprocessor<Val<SC>>,
+    ExposeClaimPreprocessor: NpoPreprocessor<Val<SC>>,
     SC::Challenge: BasedVectorSpace<Val<SC>>
         + From<Val<SC>>
         + ExtensionField<Val<SC>>
@@ -581,7 +590,11 @@ where
         } else {
             poseidon2_preprocessor::<Val<SC>>()
         };
-        vec![perm_prep, recompose_preprocessor::<Val<SC>>(cl)]
+        vec![
+            perm_prep,
+            recompose_preprocessor::<Val<SC>>(cl),
+            expose_claim_preprocessor::<Val<SC>>(),
+        ]
     }
 
     fn non_primitive_provers(&self, ext_degree: usize) -> Vec<Box<dyn TableProver<SC>>> {
@@ -602,6 +615,7 @@ where
                 _ => Vec::new(),
             };
             provers.extend(recompose_table_provers::<SC, 2>(self.0.recompose_lanes, cl));
+            provers.extend(expose_claim_table_provers::<SC, 2>());
             provers
         } else {
             Vec::new()
@@ -616,6 +630,7 @@ where
             poseidon2_air_builders::<SC, 2>()
         };
         builders.extend(recompose_air_builders::<SC, 2>(self.0.recompose_lanes, cl));
+        builders.extend(expose_claim_air_builders::<SC, 2>());
         builders
     }
 }
@@ -630,6 +645,7 @@ where
     Poseidon1Preprocessor: NpoPreprocessor<Val<SC>>,
     Poseidon2Preprocessor: NpoPreprocessor<Val<SC>>,
     RecomposePreprocessor: NpoPreprocessor<Val<SC>>,
+    ExposeClaimPreprocessor: NpoPreprocessor<Val<SC>>,
     SC::Challenge: BasedVectorSpace<Val<SC>>
         + From<Val<SC>>
         + ExtensionField<Val<SC>>
@@ -695,7 +711,11 @@ where
         } else {
             poseidon2_preprocessor::<Val<SC>>()
         };
-        vec![perm_prep, recompose_preprocessor::<Val<SC>>(cl)]
+        vec![
+            perm_prep,
+            recompose_preprocessor::<Val<SC>>(cl),
+            expose_claim_preprocessor::<Val<SC>>(),
+        ]
     }
 
     fn non_primitive_provers(&self, ext_degree: usize) -> Vec<Box<dyn TableProver<SC>>> {
@@ -716,6 +736,7 @@ where
                 _ => Vec::new(),
             };
             provers.extend(recompose_table_provers::<SC, 4>(self.0.recompose_lanes, cl));
+            provers.extend(expose_claim_table_provers::<SC, 4>());
             provers
         } else {
             Vec::new()
@@ -730,6 +751,7 @@ where
             poseidon2_air_builders::<SC, 4>()
         };
         builders.extend(recompose_air_builders::<SC, 4>(self.0.recompose_lanes, cl));
+        builders.extend(expose_claim_air_builders::<SC, 4>());
         builders
     }
 }
@@ -744,6 +766,7 @@ where
     Poseidon1Preprocessor: NpoPreprocessor<Val<SC>>,
     Poseidon2Preprocessor: NpoPreprocessor<Val<SC>>,
     RecomposePreprocessor: NpoPreprocessor<Val<SC>>,
+    ExposeClaimPreprocessor: NpoPreprocessor<Val<SC>>,
     SC::Challenge: BasedVectorSpace<Val<SC>>
         + From<Val<SC>>
         + ExtensionField<Val<SC>>
@@ -809,7 +832,11 @@ where
         } else {
             poseidon2_preprocessor::<Val<SC>>()
         };
-        vec![perm_prep, recompose_preprocessor::<Val<SC>>(cl)]
+        vec![
+            perm_prep,
+            recompose_preprocessor::<Val<SC>>(cl),
+            expose_claim_preprocessor::<Val<SC>>(),
+        ]
     }
 
     fn non_primitive_provers(&self, ext_degree: usize) -> Vec<Box<dyn TableProver<SC>>> {
@@ -824,6 +851,7 @@ where
                 _ => Vec::new(),
             };
             provers.extend(recompose_table_provers::<SC, 5>(self.0.recompose_lanes, cl));
+            provers.extend(expose_claim_table_provers::<SC, 5>());
             provers
         } else {
             Vec::new()
@@ -838,6 +866,7 @@ where
             poseidon2_air_builders_d5()
         };
         builders.extend(recompose_air_builders::<SC, 5>(self.0.recompose_lanes, cl));
+        builders.extend(expose_claim_air_builders::<SC, 5>());
         builders
     }
 }

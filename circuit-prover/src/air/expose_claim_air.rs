@@ -1,0 +1,182 @@
+//! [`ExposeClaimAir`] surfaces N witness values as table public values, BOUND
+//! to the genuine witnesses via the `WitnessChecks` bus.
+//!
+//! This is the soundness primitive behind the IVC "exposed-claim channel": a
+//! recursion verifier circuit verifies a child proof whose `air_public_targets`
+//! carry chain claims (genesis_root, final_root, num_turns, chain_digest). Those
+//! targets are ordinary witnesses SENT on the `WitnessChecks` bus by the
+//! primitive `PublicAir`. This table READS each of them back (reader
+//! multiplicity `-1`) into a main column, and constrains the table's public
+//! value for that lane to equal the value it read. Because the read is
+//! bus-bound to the genuine witness, and the public value is locally constrained
+//! to the read, the host-readable `non_primitives[].public_values` are
+//! provably the genuine verified values — not free prover-chosen scalars.
+//!
+//! # Column layout (per lane = per exposed value)
+//!
+//! **Main columns** (D per lane): `v_0, ..., v_{D-1}` — the value read off the bus.
+//!
+//! **Preprocessed columns** per lane: `witness_idx`, `read_mult` (2 columns).
+//!
+//! **Public values**: one base-field public value per lane, in lane order.
+//!
+//! # Constraints (per lane)
+//!
+//! - Receive `[witness_idx, v_0, ..., v_{D-1}]` on `WitnessChecks` with multiplicity `read_mult`.
+//! - `public_value[lane] == v_0` (the base-field coordinate of the read cell).
+//! - `v_j == 0` for `j in 1..D` (the exposed claims are base-field scalars).
+
+use alloc::vec;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
+
+use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
+use p3_field::{Field, PrimeCharacteristicRing};
+use p3_lookup::builder::InteractionBuilder;
+use p3_matrix::dense::RowMajorMatrix;
+use tracing::instrument;
+
+use super::expose_claim_columns::{EXPOSE_CLAIM_PREP_LANE_COL_MAP, EXPOSE_CLAIM_PREP_LANE_WIDTH};
+
+/// AIR for the exposed-claim table.
+///
+/// All lanes pack into a single row (the table has exactly `num_claims` lanes
+/// and one logical row), so the public values line up with the lanes directly.
+#[derive(Debug, Clone)]
+pub struct ExposeClaimAir<F, const D: usize> {
+    /// Number of claim values (= lanes = number of public values).
+    pub(crate) num_claims: usize,
+    pub(crate) preprocessed: Vec<F>,
+    pub(crate) min_height: usize,
+    _phantom: PhantomData<F>,
+}
+
+impl<F: Field + PrimeCharacteristicRing, const D: usize> ExposeClaimAir<F, D> {
+    /// Main trace width per lane: D columns (the read value).
+    pub const fn lane_width() -> usize {
+        D
+    }
+
+    /// Preprocessed width per lane: `[witness_idx, read_mult]`.
+    pub const fn preprocessed_lane_width() -> usize {
+        EXPOSE_CLAIM_PREP_LANE_WIDTH
+    }
+
+    /// Create a new `ExposeClaimAir` with the given preprocessed data.
+    pub fn new_with_preprocessed(
+        num_claims: usize,
+        preprocessed: Vec<F>,
+        min_height: usize,
+    ) -> Self {
+        Self {
+            num_claims: num_claims.max(1),
+            preprocessed,
+            min_height,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Build the single-row main trace matrix from the exposed-claim rows.
+    #[instrument(skip_all, name = "ExposeClaimAir::build_trace")]
+    pub fn trace_to_matrix(
+        rows: &[p3_circuit::ops::expose_claim::ExposeClaimCircuitRow<F>],
+    ) -> RowMajorMatrix<F> {
+        let lane_w = Self::lane_width();
+        let num_claims = rows.len().max(1);
+        let row_width = num_claims * lane_w;
+
+        let mut values = F::zero_vec(row_width);
+        for (lane, row) in rows.iter().enumerate() {
+            // Base-field claim embedded as (value, 0, ..., 0).
+            values[lane * lane_w] = row.value;
+        }
+
+        let mut mat = RowMajorMatrix::new(values, row_width);
+        mat.pad_to_power_of_two_height(F::ZERO);
+        mat
+    }
+}
+
+impl<F: Field, const D: usize> BaseAir<F> for ExposeClaimAir<F, D> {
+    fn width(&self) -> usize {
+        self.num_claims * D
+    }
+
+    fn num_public_values(&self) -> usize {
+        self.num_claims
+    }
+
+    fn preprocessed_width(&self) -> usize {
+        self.num_claims * Self::preprocessed_lane_width()
+    }
+
+    fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
+        let width = self.num_claims * Self::preprocessed_lane_width();
+        let mut mat = RowMajorMatrix::from_flat_padded(self.preprocessed.to_vec(), width, F::ZERO);
+        mat.pad_to_min_power_of_two_height(self.min_height, F::ZERO);
+        Some(mat)
+    }
+
+    fn main_next_row_columns(&self) -> Vec<usize> {
+        vec![]
+    }
+
+    fn preprocessed_next_row_columns(&self) -> Vec<usize> {
+        vec![]
+    }
+}
+
+impl<AB: AirBuilder + InteractionBuilder, const D: usize> Air<AB> for ExposeClaimAir<AB::F, D>
+where
+    AB::F: Field,
+{
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let main_local = main.current_slice();
+        let prep = builder.preprocessed().clone();
+        let prep_local = prep.current_slice();
+        let pis = builder.public_values().to_vec();
+
+        let lane_w = Self::lane_width();
+        let prep_lane_w = Self::preprocessed_lane_width();
+
+        for lane in 0..self.num_claims {
+            let main_off = lane * lane_w;
+            let prep_off = lane * prep_lane_w;
+
+            let witness_idx: AB::Expr =
+                prep_local[prep_off + EXPOSE_CLAIM_PREP_LANE_COL_MAP.witness_idx].into();
+            let read_mult: AB::Expr =
+                prep_local[prep_off + EXPOSE_CLAIM_PREP_LANE_COL_MAP.read_mult].into();
+
+            // Receive the witness cell off the WitnessChecks bus. The reader
+            // multiplicity (`-1` per active lane) is matched by the writer
+            // `PublicAir` send, keeping the bus balanced.
+            let mut values: Vec<AB::Expr> = Vec::with_capacity(1 + D);
+            values.push(witness_idx);
+            for j in 0..D {
+                values.push(main_local[main_off + j].into());
+            }
+            builder.push_interaction("WitnessChecks", values, read_mult.clone(), 1);
+
+            // Active-lane selector: `-read_mult` is `1` on a real lane (read_mult
+            // == -1) and `0` on a padding row (read_mult == 0). All local
+            // constraints below are GATED by it so padding rows (which carry zero
+            // main columns) do not force the nonzero public value to zero.
+            let active: AB::Expr = AB::Expr::ZERO - read_mult;
+
+            // Bind the table's public value to the value read off the bus:
+            // `active * (public_value[lane] - v_0) == 0`.
+            let pv: AB::Expr = pis[lane].into();
+            let v0: AB::Expr = main_local[main_off].into();
+            builder.assert_zero(active.clone() * (pv - v0));
+
+            // The exposed claims are base-field scalars: the higher coefficients
+            // of the read EF cell must be zero (gated to active lanes).
+            for j in 1..D {
+                let vj: AB::Expr = main_local[main_off + j].into();
+                builder.assert_zero(active.clone() * vj);
+            }
+        }
+    }
+}
