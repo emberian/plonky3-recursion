@@ -22,9 +22,15 @@
 //!
 //! # Constraints (per lane)
 //!
-//! - Receive `[witness_idx, v_0, ..., v_{D-1}]` on `WitnessChecks` with multiplicity `read_mult`.
-//! - `public_value[lane] == v_0` (the base-field coordinate of the read cell).
-//! - `v_j == 0` for `j in 1..D` (the exposed claims are base-field scalars).
+//! - Receive the FULL `[witness_idx, v_0, ..., v_{D-1}]` ext tuple on `WitnessChecks`
+//!   with multiplicity `read_mult` — bus-bound to the genuine witness the creating
+//!   table sent, so `v_1..v_{D-1}` cannot be freely chosen by the prover.
+//! - `public_value[lane] == v_0` (coeff-0 of the read cell is the host-readable claim),
+//!   gated by the active-lane selector so padding rows do not force it to zero.
+//! - The higher coeffs `v_1..v_{D-1}` are NOT constrained to zero: a witness may pack
+//!   genuinely-nonzero base lanes into one ext element (e.g. a Poseidon2 output limb),
+//!   so forcing them to zero would receive a different tuple than was sent and unbalance
+//!   the global bus. Their soundness comes from the bus binding, not a local zero check.
 
 use alloc::vec;
 use alloc::vec::Vec;

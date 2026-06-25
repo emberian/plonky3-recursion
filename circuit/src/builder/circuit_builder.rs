@@ -484,8 +484,12 @@ where
     /// underlying witnesses via the `WitnessChecks` bus.
     ///
     /// All targets are exposed in ONE expose-claim table whose `public_values`
-    /// carry their base-field values in order. The values must be base-field
-    /// scalars (their higher extension coefficients are constrained to zero).
+    /// carry coeff-0 of each target in order. The FULL D-coeff ext tuple of each
+    /// target is read on the `WitnessChecks` bus and bus-bound to the genuine
+    /// witness; only coeff-0 is surfaced as the host-readable public value. The
+    /// higher coefficients are NOT constrained to zero (a witness may pack
+    /// genuinely-nonzero base lanes into one ext element, e.g. a Poseidon2 output
+    /// limb) — their soundness comes from the bus binding, not a local zero check.
     ///
     /// [`Self::enable_expose_claim`] must have been called first.
     pub fn expose_as_public_output(&mut self, targets: &[ExprId]) {
