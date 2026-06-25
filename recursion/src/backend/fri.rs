@@ -729,10 +729,28 @@ where
                     *c,
                     ConstraintProfile::Standard,
                 ))],
-                (_, Some(c)) => vec![Box::new(Poseidon2Prover::new(
-                    *c,
-                    ConstraintProfile::Standard,
-                ))],
+                (_, Some(c)) => {
+                    let mut v: Vec<Box<dyn TableProver<SC>>> =
+                        vec![Box::new(Poseidon2Prover::new(*c, ConstraintProfile::Standard))];
+                    // A circuit may carry a SECOND, isolated Poseidon2 op-type — a
+                    // `BABY_BEAR_D4_W24` permutation distinct from the W16 challenger perm
+                    // (used by the IVC segment-digest sponge so its rows share no chain-state /
+                    // CTL bus / connect graph with the FRI challenger). Its op-type is keyed by
+                    // config, so a dedicated prover is registered when the W24 perm differs from
+                    // the challenger config. The AIR builder and preprocessor are already
+                    // config-agnostic (they dispatch per op via `from_variant_name`); only the
+                    // table prover is config-keyed, so this is the single addition needed. The
+                    // prover is inert when no W24 op is present in a proof (its op-type matches
+                    // nothing).
+                    let w24 = Poseidon2Config::BABY_BEAR_D4_W24;
+                    if *c != w24 {
+                        v.push(Box::new(Poseidon2Prover::new(
+                            w24,
+                            ConstraintProfile::Standard,
+                        )));
+                    }
+                    v
+                }
                 _ => Vec::new(),
             };
             provers.extend(recompose_table_provers::<SC, 4>(self.0.recompose_lanes, cl));

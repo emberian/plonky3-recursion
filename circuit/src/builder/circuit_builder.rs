@@ -240,6 +240,53 @@ where
         self.register_npo(plugin);
     }
 
+    /// Enables Poseidon2 for configs with WIDTH=24 (e.g. BabyBear D4 W24).
+    ///
+    /// Packs `width_ext = WIDTH/D` extension limbs into 24 base lanes exactly as
+    /// [`Self::enable_poseidon2_perm`] does for width 16: ext limb `i` occupies base
+    /// lanes `[i*D .. (i+1)*D]`. Used to give a circuit a SECOND, fully-isolated
+    /// Poseidon2 op-type (distinct `NpoTypeId`, chain-state, CTL bus) from the
+    /// width-16 challenger permutation.
+    pub fn enable_poseidon2_perm_width_24<Config, P>(
+        &mut self,
+        trace_generator: TraceGeneratorFn<F>,
+        perm: P,
+    ) where
+        Config: Poseidon2Params,
+        F: Field + ExtensionField<Config::BaseField>,
+        P: Permutation<[Config::BaseField; 24]> + Clone + Send + Sync + 'static,
+    {
+        assert!(
+            Config::WIDTH == 24,
+            "enable_poseidon2_perm_width_24 requires WIDTH=24"
+        );
+        let d = Config::D;
+        let width_ext = Config::WIDTH_EXT;
+        let exec: Poseidon2PermExec<F> = Arc::new(move |input: &[F]| {
+            let mut base_input = vec![Config::BaseField::ZERO; 24];
+            for (i, ext_elem) in input.iter().enumerate() {
+                let coeffs = ext_elem.as_basis_coefficients_slice();
+                base_input[i * d..(i + 1) * d].copy_from_slice(coeffs);
+            }
+            let base_output = perm.permute(
+                base_input
+                    .try_into()
+                    .expect("base_input length must equal 24"),
+            );
+            let mut output = Vec::with_capacity(width_ext);
+            for i in 0..width_ext {
+                let coeffs = &base_output[i * d..(i + 1) * d];
+                output.push(
+                    F::from_basis_coefficients_slice(coeffs)
+                        .expect("basis coefficients should be valid"),
+                );
+            }
+            output
+        });
+        let plugin = Poseidon2CircuitPlugin::new(Config::CONFIG, exec, trace_generator);
+        self.register_npo(plugin);
+    }
+
     /// Enables the Poseidon2 permutation operation for base field challenges (D=1).
     ///
     /// This variant is for tests/circuits using base field as the challenge type.

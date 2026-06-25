@@ -284,7 +284,41 @@ impl<'a, F: Field> CircuitRunner<'a, F> {
                     match kind {
                         AluOpKind::Add => {
                             let a_val = self.get_witness(a)?;
-                            if let Some(b_val) = self.witness_value(b) {
+                            // An Add op encodes the CONSTRAINT `a + b = out`, used both forward
+                            // (`out` fresh) and backward (the `sub` lowering `add(rhs, result, lhs)`,
+                            // `result` fresh / `out == lhs` pre-set). The direction was previously
+                            // chosen on "is `b` set?", which mis-fires when `b` (the sub result) is
+                            // bound to an already-set witness (e.g. a Public) while `out` is also
+                            // pre-set (e.g. the shared `ExprId::ZERO`/`WitnessId(0)` for `sub(ZERO, x)`):
+                            // the forward branch then OVERWRITES the shared `out` slot with `a + b`,
+                            // clobbering it. Pick the branch by which slot is UNSET; when BOTH are
+                            // already set, the op is a pure constraint to VERIFY (fail-closed).
+                            let b_set = self.witness_value(b);
+                            let out_set = self.witness_value(out);
+                            if b_set.is_some() && out_set.is_some() {
+                                let b_val = b_set.unwrap();
+                                let out_val = out_set.unwrap();
+                                if a_val + b_val != out_val {
+                                    return Err(CircuitError::WitnessConflict {
+                                        witness_id: out,
+                                        existing: format!("{out_val:?}"),
+                                        new: format!("{:?}", a_val + b_val),
+                                        expr_ids: vec![],
+                                    });
+                                }
+                                alu_records.push(AluOpRecord {
+                                    kind,
+                                    a_index: a,
+                                    b_index: b,
+                                    c_index,
+                                    out_index: out,
+                                    a_val,
+                                    b_val,
+                                    c_val: F::ZERO,
+                                    out_val,
+                                });
+                            } else if out_set.is_none() {
+                                let b_val = self.get_witness(b)?;
                                 let result = a_val + b_val;
                                 self.set_witness(out, result)?;
                                 alu_records.push(AluOpRecord {

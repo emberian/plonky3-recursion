@@ -402,9 +402,24 @@ where
     }
 
     // Iterate air builders first (fixed registration order) so that the
-    // resulting AIR ordering matches the prover's non_primitive_provers order.
+    // resulting AIR ordering matches the prover's `non_primitive_provers` order.
+    //
+    // A single builder may match MORE THAN ONE op_type (e.g. the config-agnostic
+    // `Poseidon2AirBuilder` matches BOTH `poseidon2_perm/baby_bear_d4_w16` — the FRI
+    // challenger perm — AND `poseidon2_perm/baby_bear_d4_w24` — the isolated IVC
+    // segment-digest perm). So a builder must build EVERY op it matches, not just the
+    // first one. And it must do so in a DETERMINISTIC order: `non_primitive_base` is a
+    // `HashMap`, whose `.iter()` order is unspecified — iterating it directly would build
+    // the multiple poseidon tables in a random order each run, desyncing the AIR index
+    // from `common.preprocessed.instances[i]` (which is built by `airs` position) and from
+    // the prover's per-config table order, producing a wrong-width preprocessed slice at
+    // symbolic constraint extraction. Iterate the matched op_types SORTED so the order is
+    // stable and matches the prover side (which registers config-keyed provers; their
+    // op_type strings sort the same way).
     for builder in non_primitive_air_builders {
-        for (op_type, prep_base) in non_primitive_base.iter() {
+        let mut matched: Vec<(&NpoTypeId, &Vec<Val<SC>>)> = non_primitive_base.iter().collect();
+        matched.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        for (op_type, prep_base) in matched {
             // TablePacking overrides the builder's own default lane count.
             let lanes = packing
                 .npo_lanes(op_type)
@@ -413,7 +428,6 @@ where
                 builder.try_build(op_type, prep_base, min_height, lanes, constraint_profile)
             {
                 table_preps.push((air, degree));
-                break;
             }
         }
     }

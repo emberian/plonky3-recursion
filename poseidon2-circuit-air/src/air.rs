@@ -987,13 +987,24 @@ pub(crate) fn eval<
                     .assert_zero(next_in[i * D + d] - local_out[i * D + d]);
             }
         }
-        for i in 0..RATE_EXT {
-            let gate_right_i = next_prep.input_limbs[i].merkle_chain_sel * next_bit;
-            for d in 0..D {
-                builder
-                    .when_transition()
-                    .when(gate_right_i.clone())
-                    .assert_zero(next_in[(RATE_EXT + i) * D + d] - local_out[i * D + d]);
+        // The Merkle-compression layout places the sibling in the SECOND `RATE_EXT` limbs
+        // (`next_in[(RATE_EXT + i)*D + ..]`), which only exists when the rate and its sibling
+        // both fit in the state: `2 * RATE_EXT <= WIDTH_EXT`. That holds for the
+        // square-capacity widths (e.g. W16: rate 2 + cap 2) but NOT for W24 (rate 4, cap 2,
+        // width 6) — there the sibling half would index past the state and Merkle mode is
+        // simply unsupported. The Merkle rows are gated off for non-Merkle perms
+        // (`merkle_chain_sel == 0`), so skipping constraint EMISSION for a geometry that can't
+        // hold a sibling is sound — the constraint never fires — and it avoids an
+        // out-of-bounds limb access while building the AIR.
+        if 2 * RATE_EXT <= WIDTH_EXT {
+            for i in 0..RATE_EXT {
+                let gate_right_i = next_prep.input_limbs[i].merkle_chain_sel * next_bit;
+                for d in 0..D {
+                    builder
+                        .when_transition()
+                        .when(gate_right_i.clone())
+                        .assert_zero(next_in[(RATE_EXT + i) * D + d] - local_out[i * D + d]);
+                }
             }
         }
 
