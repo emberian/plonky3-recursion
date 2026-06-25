@@ -90,7 +90,7 @@ impl<const D: usize> ExposeClaimProver<D> {
             preprocessed,
             min_height,
         );
-        let matrix = ExposeClaimAir::<Val<SC>, D>::trace_to_matrix(&t.operations);
+        let matrix = ExposeClaimAir::<Val<SC>, D>::trace_to_matrix(&t.operations, min_height);
 
         Some(BatchTableInstance {
             op_type,

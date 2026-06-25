@@ -294,26 +294,30 @@ where
         .iter()
         .zip(trace_domains.iter())
         .zip(opened_values.instances.iter())
-        .map(|((ext_dom, trace_dom), inst)| {
-            let zeta_next =
-                trace_dom
-                    .next_point(zeta)
-                    .ok_or(GenerationError::InvalidProofShape(
-                        "trace domain lacks next point",
-                    ))?;
-            Ok((
-                *ext_dom,
-                vec![
-                    (zeta, inst.base_opened_values.trace_local.clone()),
-                    (
-                        zeta_next,
-                        inst.base_opened_values
-                            .trace_next
-                            .clone()
-                            .expect("trace_next is always present"),
-                    ),
-                ],
-            ))
+        .zip(airs.iter())
+        .map(|(((ext_dom, trace_dom), inst), air)| {
+            // Mirror native `prove_batch`: open at zeta_next only when the AIR
+            // accesses next-row main columns. Keep the Fiat-Shamir schedule
+            // identical to the recursive verifier.
+            let mut points = vec![(zeta, inst.base_opened_values.trace_local.clone())];
+            if !air.main_next_row_columns().is_empty() {
+                let zeta_next =
+                    trace_dom
+                        .next_point(zeta)
+                        .ok_or(GenerationError::InvalidProofShape(
+                            "trace domain lacks next point",
+                        ))?;
+                points.push((
+                    zeta_next,
+                    inst.base_opened_values
+                        .trace_next
+                        .clone()
+                        .ok_or(GenerationError::InvalidProofShape(
+                            "trace_next missing for next-row AIR",
+                        ))?,
+                ));
+            }
+            Ok((*ext_dom, points))
         })
         .collect::<Result<Vec<_>, GenerationError>>()?;
     coms_to_verify.push((commitments.main.clone(), trace_round));
@@ -385,9 +389,16 @@ where
             let local = inst.base_opened_values.preprocessed_local.as_ref().ok_or(
                 GenerationError::InvalidProofShape("preprocessed local values should exist"),
             )?;
-            let next = inst.base_opened_values.preprocessed_next.as_ref().ok_or(
-                GenerationError::InvalidProofShape("preprocessed next values should exist"),
-            )?;
+            // Mirror native `prove_batch`: a preprocessed next-row opening exists
+            // only when the AIR accesses next-row preprocessed columns.
+            let needs_prep_next = !airs[inst_idx].preprocessed_next_row_columns().is_empty();
+            let next = if needs_prep_next {
+                Some(inst.base_opened_values.preprocessed_next.as_ref().ok_or(
+                    GenerationError::InvalidProofShape("preprocessed next values should exist"),
+                )?)
+            } else {
+                None
+            };
 
             // Validate that the preprocessed data's degree metadata matches this instance.
             let ext_db = degree_bits[inst_idx];
@@ -406,14 +417,16 @@ where
 
             let base_db = meta.degree_bits;
             let pre_domain = pcs.natural_domain_for_degree(1 << base_db);
-            let zeta_next_i = trace_domains[inst_idx].next_point(zeta).ok_or(
-                GenerationError::InvalidProofShape("Preprocessed domain lacks next point"),
-            )?;
 
-            pre_round.push((
-                pre_domain,
-                vec![(zeta, local.clone()), (zeta_next_i, next.clone())],
-            ));
+            let mut pre_points = vec![(zeta, local.clone())];
+            if let Some(next) = next {
+                let zeta_next_i = trace_domains[inst_idx].next_point(zeta).ok_or(
+                    GenerationError::InvalidProofShape("Preprocessed domain lacks next point"),
+                )?;
+                pre_points.push((zeta_next_i, next.clone()));
+            }
+
+            pre_round.push((pre_domain, pre_points));
         }
 
         coms_to_verify.push((global.commitment.clone(), pre_round));

@@ -348,6 +348,14 @@ impl<F: Field, EF: ExtensionField<F>, LG: LookupProtocol> RecursiveAir<F, EF, LG
     ) -> usize {
         0
     }
+
+    fn uses_main_next_row(&self) -> bool {
+        false
+    }
+
+    fn uses_preprocessed_next_row(&self) -> bool {
+        false
+    }
 }
 
 /// Preprocessed prover data for a fixed verification circuit shape, produced offline by

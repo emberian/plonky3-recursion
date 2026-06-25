@@ -721,12 +721,25 @@ mod tests {
 
         let f = BabyBear::from_u64;
         let neg_111 = -f(111);
+        // `assert_zero(sub_result)` is now a DEFERRED const-connect: `sub_result` keeps its OWN
+        // witness (W5, holding 0) instead of being aliased into the zero const's WitnessId(0),
+        // and a `MulAdd(sub_result, ZERO, ZERO, sub_result)` row (sub_result*0 + 0 == sub_result)
+        // binds it to zero. The negated const `-111` lands at W6. This is the sound representation
+        // that prevents the circuit-wide `WitnessId(0)` aliasing collapse.
         assert_eq!(
             traces,
             Traces {
-                witness_trace: WitnessTrace::new(vec![f(0), f(37), f(111), f(3), f(111), neg_111]),
+                witness_trace: WitnessTrace::new(vec![
+                    f(0),
+                    f(37),
+                    f(111),
+                    f(3),
+                    f(111),
+                    f(0),
+                    neg_111
+                ]),
                 const_trace: ConstTrace {
-                    index: vec![WitnessId(0), WitnessId(1), WitnessId(2), WitnessId(5)],
+                    index: vec![WitnessId(0), WitnessId(1), WitnessId(2), WitnessId(6)],
                     values: vec![f(0), f(37), f(111), neg_111],
                 },
                 public_trace: PublicTrace {
@@ -734,11 +747,16 @@ mod tests {
                     values: vec![],
                 },
                 alu_trace: AluTrace {
-                    op_kind: vec![AluOpKind::Mul, AluOpKind::Add],
-                    values: vec![[f(37), f(3), f(0), f(111)], [f(111), neg_111, f(0), f(0)]],
+                    op_kind: vec![AluOpKind::Mul, AluOpKind::Add, AluOpKind::MulAdd],
+                    values: vec![
+                        [f(37), f(3), f(0), f(111)],
+                        [f(111), neg_111, f(0), f(0)],
+                        [f(0), f(0), f(0), f(0)],
+                    ],
                     indices: vec![
                         [WitnessId(1), WitnessId(3), WitnessId(0), WitnessId(4)],
-                        [WitnessId(4), WitnessId(5), WitnessId(0), WitnessId(0)],
+                        [WitnessId(4), WitnessId(6), WitnessId(0), WitnessId(5)],
+                        [WitnessId(5), WitnessId(0), WitnessId(0), WitnessId(5)],
                     ],
                 },
                 non_primitive_traces: HashMap::new(),

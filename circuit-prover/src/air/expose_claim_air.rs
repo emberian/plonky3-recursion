@@ -76,10 +76,16 @@ impl<F: Field + PrimeCharacteristicRing, const D: usize> ExposeClaimAir<F, D> {
         }
     }
 
-    /// Build the single-row main trace matrix from the exposed-claim rows.
+    /// Build the single-row main trace matrix from the exposed-claim rows, padded to the SAME
+    /// `min_height` the preprocessed trace ([`Self::preprocessed_trace`]) and the reported table
+    /// degree use — matching the convention of the sibling single-row tables (`ConstAir`,
+    /// `PublicAir`, `RecomposeAir`), which all take a `min_height` and pad to it. (The batch prover
+    /// re-pads non-primitive traces to `min_height` downstream regardless, so this is a defensive
+    /// consistency fix at the source rather than a behavioural change to the committed proof.)
     #[instrument(skip_all, name = "ExposeClaimAir::build_trace")]
     pub fn trace_to_matrix(
         rows: &[p3_circuit::ops::expose_claim::ExposeClaimCircuitRow<F>],
+        min_height: usize,
     ) -> RowMajorMatrix<F> {
         let lane_w = Self::lane_width();
         let num_claims = rows.len().max(1);
@@ -92,7 +98,8 @@ impl<F: Field + PrimeCharacteristicRing, const D: usize> ExposeClaimAir<F, D> {
         }
 
         let mut mat = RowMajorMatrix::new(values, row_width);
-        mat.pad_to_power_of_two_height(F::ZERO);
+        // Pad to `min_height` (power-of-two), matching `preprocessed_trace` + the reported degree.
+        mat.pad_to_min_power_of_two_height(min_height, F::ZERO);
         mat
     }
 }

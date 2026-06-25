@@ -2,7 +2,7 @@
 
 use hashbrown::HashMap;
 use p3_air::symbolic::AirLayout;
-use p3_air::{Air, SymbolicExpressionExt};
+use p3_air::{Air, BaseAir, SymbolicExpressionExt};
 use p3_batch_stark::symbolic::{get_log_num_quotient_chunks, get_symbolic_constraints};
 use p3_circuit::CircuitBuilder;
 use p3_circuit::symbolic::{ColumnsTargets, SymbolicCompiler};
@@ -82,6 +82,21 @@ pub trait RecursiveAir<F: Field, EF: ExtensionField<F>, LG: LookupProtocol> {
         is_zk: usize,
         lookup_gadget: &LG,
     ) -> usize;
+
+    /// Whether the AIR accesses next-row main-trace columns.
+    ///
+    /// Mirrors `BaseAir::main_next_row_columns`. When `false`, the native
+    /// `prove_batch` opening schedule emits no `trace_next` opening for this
+    /// instance, so the recursive verifier / challenge generator must not expect
+    /// one. Single-row/constant tables (e.g. `ConstAir`, `ExposeClaimAir`)
+    /// override this to `false`.
+    fn uses_main_next_row(&self) -> bool;
+
+    /// Whether the AIR accesses next-row preprocessed columns.
+    ///
+    /// Mirrors `BaseAir::preprocessed_next_row_columns`. See
+    /// [`Self::uses_main_next_row`] for the opening-schedule implications.
+    fn uses_preprocessed_next_row(&self) -> bool;
 }
 
 impl<F: Field, EF: ExtensionField<F>, A, LG: LookupProtocol> RecursiveAir<F, EF, LG> for A
@@ -171,5 +186,13 @@ where
             ..Default::default()
         };
         get_log_num_quotient_chunks(self, layout, contexts, is_zk, lookup_gadget)
+    }
+
+    fn uses_main_next_row(&self) -> bool {
+        !BaseAir::<F>::main_next_row_columns(self).is_empty()
+    }
+
+    fn uses_preprocessed_next_row(&self) -> bool {
+        !BaseAir::<F>::preprocessed_next_row_columns(self).is_empty()
     }
 }

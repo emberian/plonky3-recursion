@@ -80,6 +80,38 @@ where
             Self::Dynamic(a) => P3BaseAir::num_public_values(a),
         }
     }
+
+    fn preprocessed_width(&self) -> usize {
+        match self {
+            Self::Const(a) => P3BaseAir::preprocessed_width(a),
+            Self::Public(a) => P3BaseAir::preprocessed_width(a),
+            Self::Alu(a) => P3BaseAir::preprocessed_width(a),
+            Self::Dynamic(a) => P3BaseAir::preprocessed_width(a),
+        }
+    }
+
+    /// Forward next-row column reporting to the wrapped AIR so the recursive
+    /// verifier's opening schedule matches native `prove_batch`. Without this,
+    /// the `BaseAir` default `(0..width)` / `(0..preprocessed_width)` is used,
+    /// which disagrees with single-row tables (e.g. `ConstAir`, `PublicAir`)
+    /// that override these to return empty — producing a schedule mismatch.
+    fn main_next_row_columns(&self) -> Vec<usize> {
+        match self {
+            Self::Const(a) => P3BaseAir::main_next_row_columns(a),
+            Self::Public(a) => P3BaseAir::main_next_row_columns(a),
+            Self::Alu(a) => P3BaseAir::main_next_row_columns(a),
+            Self::Dynamic(a) => P3BaseAir::main_next_row_columns(a),
+        }
+    }
+
+    fn preprocessed_next_row_columns(&self) -> Vec<usize> {
+        match self {
+            Self::Const(a) => P3BaseAir::preprocessed_next_row_columns(a),
+            Self::Public(a) => P3BaseAir::preprocessed_next_row_columns(a),
+            Self::Alu(a) => P3BaseAir::preprocessed_next_row_columns(a),
+            Self::Dynamic(a) => P3BaseAir::preprocessed_next_row_columns(a),
+        }
+    }
 }
 
 impl<SC, const D: usize>
@@ -600,18 +632,28 @@ where
             .unwrap_or(0);
         preprocessed_widths.push(pre_w);
 
+        // Mirror native `prove_batch`: next-row openings exist only when the AIR
+        // actually accesses next-row columns. AIRs that override
+        // `main_next_row_columns()` / `preprocessed_next_row_columns()` to return
+        // empty (e.g. single-row/constant tables) emit `trace_next: None` /
+        // `preprocessed_next: None`, so the verifier must expect no next-row
+        // opening for them.
+        let needs_trace_next = air.uses_main_next_row();
+        let needs_prep_next = air.uses_preprocessed_next_row();
+
         let local_prep_len = preprocessed_local_targets.as_ref().map_or(0, |v| v.len());
         let next_prep_len = preprocessed_next_targets.as_ref().map_or(0, |v| v.len());
-        if local_prep_len != pre_w || next_prep_len != pre_w {
+        let expected_next_prep = if needs_prep_next { pre_w } else { 0 };
+        if local_prep_len != pre_w || next_prep_len != expected_next_prep {
             return Err(VerificationError::InvalidProofShape(format!(
-                "Instance has incorrect preprocessed width: expected {pre_w}, got {local_prep_len} / {next_prep_len}"
+                "Instance has incorrect preprocessed width: expected {pre_w} / {expected_next_prep}, got {local_prep_len} / {next_prep_len}"
             )));
         }
         let air_width = A::width(air);
-        if trace_local_targets.len() != air_width || trace_next_targets.len() != air_width {
+        let expected_trace_next = if needs_trace_next { air_width } else { 0 };
+        if trace_local_targets.len() != air_width || trace_next_targets.len() != expected_trace_next {
             return Err(VerificationError::InvalidProofShape(format!(
-                "Instance has incorrect trace width: expected {}, got {} / {}",
-                air_width,
+                "Instance has incorrect trace width: expected {air_width} / {expected_trace_next}, got {} / {}",
                 trace_local_targets.len(),
                 trace_next_targets.len()
             )));
@@ -855,29 +897,30 @@ where
         .iter()
         .zip(trace_domains.iter())
         .zip(instances.iter())
-        .map(|((ext_dom, trace_dom), inst)| {
-            let first_point = pcs.first_point(trace_dom);
-            let next_point = trace_dom.next_point(first_point).ok_or_else(|| {
-                VerificationError::InvalidProofShape(
-                    "Trace domain does not provide next point".to_string(),
-                )
-            })?;
-            let generator = next_point * first_point.inverse();
-            let generator_const = circuit.define_const(generator);
-            let zeta_next = circuit.mul(zeta, generator_const);
-            Ok((
-                *ext_dom,
-                vec![
-                    (
-                        zeta,
-                        inst.opened_values_no_lookups.trace_local_targets.clone(),
-                    ),
-                    (
-                        zeta_next,
-                        inst.opened_values_no_lookups.trace_next_targets.clone(),
-                    ),
-                ],
-            ))
+        .zip(airs.iter())
+        .map(|(((ext_dom, trace_dom), inst), air)| {
+            // Mirror native `prove_batch`: open at zeta_next only when the AIR
+            // accesses next-row main columns.
+            let mut points = vec![(
+                zeta,
+                inst.opened_values_no_lookups.trace_local_targets.clone(),
+            )];
+            if air.uses_main_next_row() {
+                let first_point = pcs.first_point(trace_dom);
+                let next_point = trace_dom.next_point(first_point).ok_or_else(|| {
+                    VerificationError::InvalidProofShape(
+                        "Trace domain does not provide next point".to_string(),
+                    )
+                })?;
+                let generator = next_point * first_point.inverse();
+                let generator_const = circuit.define_const(generator);
+                let zeta_next = circuit.mul(zeta, generator_const);
+                points.push((
+                    zeta_next,
+                    inst.opened_values_no_lookups.trace_next_targets.clone(),
+                ));
+            }
+            Ok((*ext_dom, points))
         })
         .collect::<Result<_, VerificationError>>()?;
     coms_to_verify.push((commitments_targets.trace_targets.clone(), trace_round));
@@ -955,15 +998,23 @@ where
                         "Missing preprocessed local columns".to_string(),
                     )
                 })?;
-            let next = inst
-                .opened_values_no_lookups
-                .preprocessed_next_targets
-                .as_ref()
-                .ok_or_else(|| {
-                    VerificationError::InvalidProofShape(
-                        "Missing preprocessed next columns".to_string(),
-                    )
-                })?;
+            // Mirror native `prove_batch`: a preprocessed next-row opening exists
+            // only when the AIR accesses next-row preprocessed columns.
+            let needs_prep_next = airs[inst_idx].uses_preprocessed_next_row();
+            let next = if needs_prep_next {
+                Some(
+                    inst.opened_values_no_lookups
+                        .preprocessed_next_targets
+                        .as_ref()
+                        .ok_or_else(|| {
+                            VerificationError::InvalidProofShape(
+                                "Missing preprocessed next columns".to_string(),
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
             // Validate that the preprocessed data's degree metadata matches this instance.
             let ext_db = degree_bits[inst_idx];
 
@@ -983,22 +1034,23 @@ where
             // Compute base preprocessed domain (matching prover in generation.rs)
             let pre_domain = pcs.natural_domain_for_degree(1 << meta.degree_bits);
 
-            // Use the base trace domain for zeta_next computation.
-            let trace_dom = &trace_domains[inst_idx];
-            let first_point = pcs.first_point(trace_dom);
-            let next_point = trace_dom.next_point(first_point).ok_or_else(|| {
-                VerificationError::InvalidProofShape(
-                    "Preprocessed domain does not provide next point".to_string(),
-                )
-            })?;
-            let generator = next_point * first_point.inverse();
-            let generator_const = circuit.define_const(generator);
-            let zeta_next = circuit.mul(zeta, generator_const);
+            let mut pre_points = vec![(zeta, local.clone())];
+            if let Some(next) = next {
+                // Use the base trace domain for zeta_next computation.
+                let trace_dom = &trace_domains[inst_idx];
+                let first_point = pcs.first_point(trace_dom);
+                let next_point = trace_dom.next_point(first_point).ok_or_else(|| {
+                    VerificationError::InvalidProofShape(
+                        "Preprocessed domain does not provide next point".to_string(),
+                    )
+                })?;
+                let generator = next_point * first_point.inverse();
+                let generator_const = circuit.define_const(generator);
+                let zeta_next = circuit.mul(zeta, generator_const);
+                pre_points.push((zeta_next, next.clone()));
+            }
 
-            pre_round.push((
-                pre_domain,
-                vec![(zeta, local.clone()), (zeta_next, next.clone())],
-            ));
+            pre_round.push((pre_domain, pre_points));
         }
 
         coms_to_verify.push((global.commitment.clone(), pre_round));
@@ -1365,12 +1417,17 @@ fn observe_opened_values_circuit<
                 &inst.opened_values_no_lookups.trace_local_targets,
                 fri_rand_local,
             );
-            observe_point(
-                circuit,
-                challenger,
-                &inst.opened_values_no_lookups.trace_next_targets,
-                fri_rand_next,
-            );
+            // Mirror native `prove_batch`: a next-row opening exists only when the
+            // AIR accesses next-row main columns. Single-row/constant tables emit
+            // no `trace_next` opening, so we must not observe one for them.
+            if !inst.opened_values_no_lookups.trace_next_targets.is_empty() {
+                observe_point(
+                    circuit,
+                    challenger,
+                    &inst.opened_values_no_lookups.trace_next_targets,
+                    fri_rand_next,
+                );
+            }
         }
         round_idx += 1;
     }

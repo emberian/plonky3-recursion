@@ -513,12 +513,10 @@ impl<SC: StarkGenericConfig> Recursive<SC::Challenge> for OpenedValuesTargets<SC
         let trace_local_targets =
             circuit.alloc_private_inputs(trace_local_len, "trace local values");
 
-        let trace_next_len = input
-            .trace_next
-            .as_ref()
-            .expect("trace_next is always present")
-            .len();
-        let trace_next_targets = circuit.alloc_private_inputs(trace_next_len, "trace next values");
+        let trace_next_targets = match input.trace_next.as_ref() {
+            Some(next) => circuit.alloc_private_inputs(next.len(), "trace next values"),
+            None => Vec::new(),
+        };
 
         let preprocessed_local_targets = input
             .preprocessed_local
@@ -570,7 +568,9 @@ impl<SC: StarkGenericConfig> Recursive<SC::Challenge> for OpenedValuesTargets<SC
 
         let mut values = vec![];
         values.extend(trace_local);
-        values.extend(trace_next.as_ref().expect("trace_next is always present"));
+        if let Some(next) = trace_next {
+            values.extend(next);
+        }
         if let Some(preprocessed_local) = preprocessed_local {
             values.extend(preprocessed_local);
         }

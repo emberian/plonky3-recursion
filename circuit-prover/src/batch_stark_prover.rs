@@ -618,6 +618,36 @@ where
             }
         }
     }
+
+    /// Forward next-row column reporting to the wrapped AIR so `prove_batch`'s
+    /// opening schedule matches each table's actual next-row access. Without
+    /// this, the `BaseAir` default `(0..width)` / `(0..preprocessed_width)` is
+    /// used for the primitive variants, emitting a spurious `zeta_next` opening
+    /// for single-row tables (e.g. `ConstAir`, `PublicAir`) that override these
+    /// to return empty — which then mismatches the recursive verifier.
+    fn main_next_row_columns(&self) -> Vec<usize> {
+        match self {
+            Self::Const(a) => BaseAir::<Val<SC>>::main_next_row_columns(a),
+            Self::Public(a) => BaseAir::<Val<SC>>::main_next_row_columns(a),
+            Self::Alu(a) => BaseAir::<Val<SC>>::main_next_row_columns(a),
+            Self::Dynamic(a) => {
+                <dyn CloneableBatchAir<SC> as BaseAir<Val<SC>>>::main_next_row_columns(a.air())
+            }
+        }
+    }
+
+    fn preprocessed_next_row_columns(&self) -> Vec<usize> {
+        match self {
+            Self::Const(a) => BaseAir::<Val<SC>>::preprocessed_next_row_columns(a),
+            Self::Public(a) => BaseAir::<Val<SC>>::preprocessed_next_row_columns(a),
+            Self::Alu(a) => BaseAir::<Val<SC>>::preprocessed_next_row_columns(a),
+            Self::Dynamic(a) => {
+                <dyn CloneableBatchAir<SC> as BaseAir<Val<SC>>>::preprocessed_next_row_columns(
+                    a.air(),
+                )
+            }
+        }
+    }
 }
 
 macro_rules! impl_circuit_table_air_for_builder {

@@ -82,6 +82,23 @@ where
     fn preprocessed_trace(&self) -> Option<RowMajorMatrix<Val<SC>>> {
         <dyn CloneableBatchAir<SC> as BaseAir<Val<SC>>>::preprocessed_trace(self.air())
     }
+
+    // Forward the wrapped AIR's next-row-column declarations. WITHOUT this, the wrapper falls
+    // back to the `BaseAir` DEFAULT (`(0..width)` = ALL columns), so a single-row table that
+    // declares NO next-row columns (e.g. `ExposeClaimAir` / the Poseidon2 perm tables, which
+    // override these to `vec![]`) is treated as needing `zeta_next` openings by the native
+    // `prove_batch` opening schedule — while the recursive verifier reconstructs the real AIR's
+    // (empty) declaration. That prover/verifier disagreement makes a genuine constant (height-1)
+    // matrix's reduced opening nonzero (claimed `f(zeta)` paired against a `zeta_next` opening it
+    // never committed), surfacing as a `WitnessConflict` at aggregation. Forwarding the override
+    // keeps the opening schedule identical on both sides.
+    fn main_next_row_columns(&self) -> Vec<usize> {
+        <dyn CloneableBatchAir<SC> as BaseAir<Val<SC>>>::main_next_row_columns(self.air())
+    }
+
+    fn preprocessed_next_row_columns(&self) -> Vec<usize> {
+        <dyn CloneableBatchAir<SC> as BaseAir<Val<SC>>>::preprocessed_next_row_columns(self.air())
+    }
 }
 
 macro_rules! impl_air_for_dynamic_entry {
