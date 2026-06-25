@@ -111,6 +111,38 @@ fn fri_verifier_params() -> FriVerifierParams {
     )
 }
 
+/// Same as `dregg_like_config` but with a parameterized `log_blowup`. The dregg
+/// `ir2_leaf_wrap` inner proof is proven at `log_blowup=6`; the prior fork tests
+/// only covered `log_blowup=3`.
+fn dregg_like_config_lb(log_blowup: usize) -> MyConfig {
+    let perm = default_babybear_poseidon2_16();
+    let hash = MyHash::new(perm.clone());
+    let compress = MyCompress::new(perm.clone());
+    let val_mmcs = MyMmcs::new(hash, compress, 0);
+    let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+    let fri_params = FriParameters {
+        log_blowup,
+        log_final_poly_len: 0,
+        max_log_arity: 1,
+        num_queries: 38,
+        commit_proof_of_work_bits: 0,
+        query_proof_of_work_bits: 14,
+        mmcs: challenge_mmcs,
+    };
+    let pcs = MyPcs::new(Dft::default(), val_mmcs, fri_params);
+    MyConfig::new(pcs, Challenger::new(perm))
+}
+
+fn fri_verifier_params_lb(log_blowup: usize) -> FriVerifierParams {
+    FriVerifierParams::with_mmcs(
+        log_blowup,
+        0,
+        0,
+        14,
+        PermConfig::poseidon2(Poseidon2Config::BABY_BEAR_D4_W16),
+    )
+}
+
 /// Enable the W16 (challenger) + W24 (segment-digest) Poseidon2 perms + recompose
 /// on a fresh circuit builder — exactly the dregg recursion-verifier table set.
 fn enable_dregg_tables(cb: &mut CircuitBuilder<Challenge>) {
@@ -343,6 +375,99 @@ fn mixed_height_perm_aggregation_folds_and_verifies() -> Result<(), Verification
 
     let common = inner_prover_data.common_data();
     let fri_params = fri_verifier_params();
+    let lookup_gadget = LogUpGadget::new();
+    let verif_provers: Vec<Box<dyn TableProver<MyConfig>>> = vec![
+        Box::new(Poseidon2Prover::new(
+            RecPoseidon2Config::BABY_BEAR_D4_W16,
+            ConstraintProfile::Standard,
+        )),
+        Box::new(Poseidon2Prover::new(
+            RecPoseidon2Config::BABY_BEAR_D4_W24,
+            ConstraintProfile::Standard,
+        )),
+    ];
+
+    let (verifier_inputs, op_ids) = verify_p3_batch_proof_circuit::<
+        MyConfig,
+        MerkleCapTargets<F, DIGEST_ELEMS>,
+        InputProofTargets<F, Challenge, RecValMmcs<F, DIGEST_ELEMS, MyHash, MyCompress>>,
+        InnerFri,
+        LogUpGadget,
+        RecPoseidon2Config,
+        WIDTH,
+        RATE,
+        D,
+    >(
+        &config,
+        &mut cb,
+        &inner_proof,
+        &fri_params,
+        common,
+        &lookup_gadget,
+        RecPoseidon2Config::BABY_BEAR_D4_W16,
+        &verif_provers,
+    )?;
+
+    let verification_circuit = cb.build().unwrap();
+    let mut runner = verification_circuit.runner();
+
+    let inner_pis: Vec<Vec<F>> = inner_proof
+        .non_primitives
+        .iter()
+        .map(|e| e.public_values.clone())
+        .collect();
+    let (public_inputs, private_inputs) =
+        verifier_inputs.pack_values(&inner_pis, &inner_proof.proof, common);
+    runner
+        .set_public_inputs(&public_inputs)
+        .map_err(VerificationError::Circuit)?;
+    runner
+        .set_private_inputs(&private_inputs)
+        .map_err(VerificationError::Circuit)?;
+
+    set_fri_mmcs_private_data::<
+        F,
+        Challenge,
+        ChallengeMmcs,
+        MyMmcs,
+        MyHash,
+        MyCompress,
+        DIGEST_ELEMS,
+    >(
+        &mut runner,
+        &op_ids,
+        &inner_proof.proof.opening_proof,
+        RecPoseidon2Config::BABY_BEAR_D4_W16,
+    )
+    .map_err(|e| VerificationError::InvalidProofShape(e.to_string()))?;
+
+    let _traces = runner.run().map_err(VerificationError::Circuit)?;
+    Ok(())
+}
+
+/// THE log_blowup=6 REPRODUCER. The dregg `ir2_leaf_wrap` inner proof is proven
+/// at `log_blowup=6` (degree-7 Poseidon2, max blowup), which the prior fork tests
+/// (all `log_blowup=3`) never covered. The prompt localizes the same-endpoint IVC
+/// residual to exactly this knob: a width-44 height-1 LogUp permutation matrix
+/// whose in-circuit leaf (`p_at_x`) + OOD opening (`p_at_z`) get witness-
+/// contaminated to full-extension values at cols 2,3 — surfacing as a
+/// WitnessConflict at the height-1 `ro==0` assert (verifier.rs ~:1326).
+#[test]
+fn mixed_height_perm_aggregation_lb6_reproduces() -> Result<(), VerificationError> {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_test_writer()
+        .try_init();
+    let log_blowup = 6;
+    let config = dregg_like_config_lb(log_blowup);
+    let (inner_proof, inner_prover_data) = prove_inner_mixed_height_perm(&config, 64);
+
+    let mut cb = CircuitBuilder::new();
+    enable_dregg_tables(&mut cb);
+    cb.enable_expose_claim::<F>(p3_circuit::ops::generate_expose_claim_trace::<F, Challenge>);
+
+    let common = inner_prover_data.common_data();
+    let fri_params = fri_verifier_params_lb(log_blowup);
     let lookup_gadget = LogUpGadget::new();
     let verif_provers: Vec<Box<dyn TableProver<MyConfig>>> = vec![
         Box::new(Poseidon2Prover::new(
