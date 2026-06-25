@@ -206,6 +206,213 @@ fn prove_inner_with_one_w24_perm(
     (proof, circuit_prover_data)
 }
 
+/// Build + prove an inner proof whose permutation round MIXES a height-1 W24
+/// perm table with a TALLER W16 perm table. This is the shape the prior handoff
+/// localized the dregg `k_fold` failure to: a genuinely degree-0 (height-1)
+/// permutation matrix SHARING the permutation round with taller LogUp instances.
+///
+/// The inner circuit runs MANY W16 challenger perms (-> a W16 `poseidon2_perm`
+/// table of height >> 1) and a SINGLE W24 perm (-> a height-1 W24 table). Both
+/// table kinds are LogUp-bearing, so the inner proof's permutation commitment
+/// carries a tall W16 perm matrix AND a height-1 W24 perm matrix in the same round.
+fn prove_inner_mixed_height_perm(
+    config: &MyConfig,
+    n_w16: usize,
+) -> (
+    p3_circuit_prover::BatchStarkProof<MyConfig>,
+    CircuitProverData<MyConfig>,
+) {
+    let mut cb = CircuitBuilder::new();
+    enable_dregg_tables(&mut cb);
+
+    // MANY INDEPENDENT W16 perms, each seeded with a distinct nonzero tag and each
+    // bound to its own public input -> a TALL W16 poseidon2_perm table (n_w16 rows),
+    // every perm load-bearing and witness-balanced. W16/D4 takes 4 ext-limb inputs.
+    let mut w16_outs = Vec::with_capacity(n_w16);
+    let mut w16_tags = Vec::with_capacity(n_w16);
+    for k in 0..n_w16 {
+        let tag_k_v = BabyBear::from_u64(0x9E37u64 + k as u64);
+        let tag_k = cb.define_const(Challenge::from(tag_k_v));
+        let state: Vec<_> = (0..4).map(|_| tag_k).collect();
+        let out = cb
+            .add_poseidon2_perm_for_challenger(Poseidon2Config::BABY_BEAR_D4_W16, &state)
+            .expect("W16 perm op builds");
+        let expected = cb.alloc_public_input("w16_out0");
+        cb.connect(out[0], expected);
+        w16_outs.push(out);
+        w16_tags.push(tag_k_v);
+    }
+
+    // A SINGLE W24 perm -> a height-1 W24 poseidon2_perm table.
+    let tag = cb.define_const(Challenge::from(BabyBear::from_u64(0x9E37u64)));
+    let w24_state: Vec<_> = (0..6).map(|_| tag).collect();
+    let w24_out = cb
+        .add_poseidon2_perm_for_challenger(Poseidon2Config::BABY_BEAR_D4_W24, &w24_state)
+        .expect("W24 perm op builds");
+    let expected_w24 = cb.alloc_public_input("w24_out0");
+    cb.connect(w24_out[0], expected_w24);
+    let _ = &w16_outs;
+
+    let circuit = cb.build().unwrap();
+    let mut runner = circuit.runner();
+
+    // Compute expected public outputs host-side.
+    let perm16 = default_babybear_poseidon2_16();
+    let perm24 = default_babybear_poseidon2_24();
+    let tag_v = BabyBear::from_u64(0x9E37u64);
+
+    // W16: each independent perm's out[0] (ext limb 0 = base lanes [0..4] recomposed).
+    // W16/D4: the 4 ext-limb inputs each = `tag_k` map to base lanes 0,4,8,12 = tag_k.
+    let mut public_vals: Vec<Challenge> = Vec::with_capacity(n_w16 + 1);
+    for &tag_k_v in &w16_tags {
+        let mut state = [BabyBear::ZERO; 16];
+        for limb in 0..4 {
+            state[limb * D] = tag_k_v;
+        }
+        let out = Permutation::permute(&perm16, state);
+        public_vals.push(
+            Challenge::from_basis_coefficients_slice(&out[0..D]).expect("valid ext coeffs"),
+        );
+    }
+
+    let mut w24_base = [BabyBear::ZERO; 24];
+    for limb in 0..6 {
+        w24_base[limb * D] = tag_v;
+    }
+    let w24_base_out = Permutation::permute(&perm24, w24_base);
+    let w24_out0 = Challenge::from_basis_coefficients_slice(&w24_base_out[0..D])
+        .expect("valid ext coeffs");
+    public_vals.push(w24_out0);
+
+    runner.set_public_inputs(&public_vals).unwrap();
+    let traces = runner.run().unwrap();
+
+    let table_packing = TablePacking::new(1, 4);
+    let npo_prep: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
+        Box::new(Poseidon2Preprocessor),
+        Box::new(RecomposePreprocessor::default()),
+    ];
+    let mut air_builders = poseidon2_air_builders::<MyConfig, D>();
+    air_builders.extend(p3_circuit_prover::batch_stark_prover::recompose_air_builders(1, false));
+    let (airs_degrees, primitive_columns, non_primitive_columns) =
+        get_airs_and_degrees_with_prep::<MyConfig, Challenge, D>(
+            &circuit,
+            &table_packing,
+            &npo_prep,
+            &air_builders,
+            ConstraintProfile::Standard,
+        )
+        .unwrap();
+    let (airs, degrees): (Vec<_>, Vec<_>) = airs_degrees.into_iter().unzip();
+    let prover_data = ProverData::from_airs_and_degrees(config, &airs, &degrees);
+    let circuit_prover_data =
+        CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+    let mut prover = BatchStarkProver::new(config.clone()).with_table_packing(table_packing);
+    prover.register_poseidon2_table::<D>(Poseidon2Config::BABY_BEAR_D4_W16);
+    prover.register_poseidon2_table::<D>(Poseidon2Config::BABY_BEAR_D4_W24);
+    prover.register_recompose_table::<D>(false);
+
+    let proof = prover
+        .prove_all_tables(&traces, &circuit_prover_data)
+        .expect("mixed-height inner proof proves");
+    prover
+        .verify_all_tables(&proof)
+        .expect("mixed-height inner proof verifies natively");
+    (proof, circuit_prover_data)
+}
+
+/// THE MIXED-HEIGHT REPRODUCER (single-level, fast): aggregate an inner proof
+/// whose permutation round mixes a height-1 W24 perm matrix with a TALLER W16
+/// perm matrix. If the height-1 leaf-ordering bug is present, the recursive
+/// `open_input` reads `p_at_x` from the wrong leaf for the height-1 permutation
+/// matrix and the `ro==0` assert (verifier.rs ~:1326) panics with a
+/// WitnessConflict. After the fix it folds + verifies.
+#[test]
+fn mixed_height_perm_aggregation_folds_and_verifies() -> Result<(), VerificationError> {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_test_writer()
+        .try_init();
+    let config = dregg_like_config();
+    // 64 W16 perms -> a W16 perm table padded to height 64 (>> 1); single W24 -> height 1.
+    let (inner_proof, inner_prover_data) = prove_inner_mixed_height_perm(&config, 64);
+
+    let mut cb = CircuitBuilder::new();
+    enable_dregg_tables(&mut cb);
+    cb.enable_expose_claim::<F>(p3_circuit::ops::generate_expose_claim_trace::<F, Challenge>);
+
+    let common = inner_prover_data.common_data();
+    let fri_params = fri_verifier_params();
+    let lookup_gadget = LogUpGadget::new();
+    let verif_provers: Vec<Box<dyn TableProver<MyConfig>>> = vec![
+        Box::new(Poseidon2Prover::new(
+            RecPoseidon2Config::BABY_BEAR_D4_W16,
+            ConstraintProfile::Standard,
+        )),
+        Box::new(Poseidon2Prover::new(
+            RecPoseidon2Config::BABY_BEAR_D4_W24,
+            ConstraintProfile::Standard,
+        )),
+    ];
+
+    let (verifier_inputs, op_ids) = verify_p3_batch_proof_circuit::<
+        MyConfig,
+        MerkleCapTargets<F, DIGEST_ELEMS>,
+        InputProofTargets<F, Challenge, RecValMmcs<F, DIGEST_ELEMS, MyHash, MyCompress>>,
+        InnerFri,
+        LogUpGadget,
+        RecPoseidon2Config,
+        WIDTH,
+        RATE,
+        D,
+    >(
+        &config,
+        &mut cb,
+        &inner_proof,
+        &fri_params,
+        common,
+        &lookup_gadget,
+        RecPoseidon2Config::BABY_BEAR_D4_W16,
+        &verif_provers,
+    )?;
+
+    let verification_circuit = cb.build().unwrap();
+    let mut runner = verification_circuit.runner();
+
+    let inner_pis: Vec<Vec<F>> = inner_proof
+        .non_primitives
+        .iter()
+        .map(|e| e.public_values.clone())
+        .collect();
+    let (public_inputs, private_inputs) =
+        verifier_inputs.pack_values(&inner_pis, &inner_proof.proof, common);
+    runner
+        .set_public_inputs(&public_inputs)
+        .map_err(VerificationError::Circuit)?;
+    runner
+        .set_private_inputs(&private_inputs)
+        .map_err(VerificationError::Circuit)?;
+
+    set_fri_mmcs_private_data::<
+        F,
+        Challenge,
+        ChallengeMmcs,
+        MyMmcs,
+        MyHash,
+        MyCompress,
+        DIGEST_ELEMS,
+    >(
+        &mut runner,
+        &op_ids,
+        &inner_proof.proof.opening_proof,
+        RecPoseidon2Config::BABY_BEAR_D4_W16,
+    )
+    .map_err(|e| VerificationError::InvalidProofShape(e.to_string()))?;
+
+    let _traces = runner.run().map_err(VerificationError::Circuit)?;
+    Ok(())
+}
+
 /// THE REPRODUCER: prove an inner proof carrying a height-1 W24 table, then
 /// recursively verify it. The recursive `open_input` hits the height-1
 /// W24 matrix opened at (zeta, zeta_next) and must yield ro==0.
