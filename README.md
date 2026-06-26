@@ -2,6 +2,99 @@
 
 Plonky3 native support for recursive STARK verification, enabling proof composition and multi-layer recursion.
 
+---
+
+## About this fork
+
+This is **dregg's fork** of [`Plonky3/Plonky3-recursion`](https://github.com/Plonky3/Plonky3-recursion). The
+upstream library gives you a recursive STARK verifier-in-a-circuit. dregg needed
+something on top of that: **IVC of arbitrary histories** — folding a long chain of
+verified state transitions into one proof that a whole-history light client can
+check and then *read claims out of*. The pieces below are the things we needed to
+make that work, and that upstream didn't have. We built them as we hit the walls;
+that's just how it was for us.
+
+None of this is framed as an upstream contribution. It's our own honest record of
+what we added and why. Where a piece turned out to be genuinely general we've
+offered it upstream as a freely-decline-able PR (noted below); the rest is
+dregg-shaped and lives here because that's where it belongs.
+
+The reassessment in [`upstream-pr/REASSESSMENT-CAPABILITY-VS-INSTANTIATION.md`](upstream-pr/REASSESSMENT-CAPABILITY-VS-INSTANTIATION.md)
+is the per-item breakdown of which parts are general capability vs. dregg
+instantiation; this section is the short version.
+
+### What we built on top, and why we needed it
+
+- **A verified public-output channel** — `expose_as_public_output(targets)` on the
+  `CircuitBuilder`, backed by the `ExposeClaim` op and its `ExposeClaimAir`.
+  ([`circuit/src/ops/expose_claim.rs`](circuit/src/ops/expose_claim.rs),
+  [`circuit/src/builder/circuit_builder.rs`](circuit/src/builder/circuit_builder.rs),
+  [`circuit-prover/src/air/expose_claim_air.rs`](circuit-prover/src/air/expose_claim_air.rs).)
+  It takes arbitrary in-circuit witnesses and surfaces them as *bound* public
+  outputs of the proof — the AIR is a pure `WitnessChecks`-bus reader, so the host
+  reads back the genuine verified witnesses, not free prover-chosen scalars.
+  **Why:** a light client folding a history needs to read things *out* of the fold
+  — chain heads, state roots, accumulator state, a turn counter. Upstream can
+  verify a fold but had no way to expose anything bound from inside it. This is the
+  keystone. We offer the abstracted capability upstream as **PR #453** (open, take
+  it or leave it).
+
+- **An in-circuit VK-identity pin** — `pin_preprocessed_commit` plus the
+  `expected_preprocessed_commit` field on `RecursionInput`.
+  ([`recursion/src/verifier/batch_stark.rs`](recursion/src/verifier/batch_stark.rs),
+  [`recursion/src/recursion.rs`](recursion/src/recursion.rs).)
+  It connects the child proof's preprocessed-commitment cap to expected constants
+  in-circuit, so a fold of a *different* circuit makes the parent unsatisfiable.
+  **Why:** IVC only closes into a genuine fixed point if "the one running circuit
+  verifies its own previous proof" is actually pinned — otherwise the chain is
+  open-ended and a from-scratch prover could fold a foreign child. This is the
+  stable anchor VK a light client needs to trust the chain.
+
+- **A native-batch leaf-wrap** — `RecursionInput::NativeBatchStark` and
+  `verify_p3_native_batch_proof_circuit`.
+  ([`recursion/src/recursion.rs`](recursion/src/recursion.rs),
+  [`recursion/src/verifier/batch_stark.rs`](recursion/src/verifier/batch_stark.rs),
+  [`recursion/src/backend/fri.rs`](recursion/src/backend/fri.rs).)
+  A thin sibling to `verify_p3_batch_proof_circuit` that folds a *bare*
+  `p3_batch_stark::BatchProof` over a **caller's own AIR set**, rather than only
+  proofs shaped like the circuit-prover's internal table model. **Why:** our base
+  layer is a real batch-STARK over our own AIRs; without this entry we could only
+  recurse over circuit-prover-shaped proofs. (The heavy lifting,
+  `verify_batch_circuit`, was already upstream — this is the glue we needed.)
+
+- **A lowerer `assert_zero` fix** — don't alias `connect(value, const)` into the
+  constant's witness slot. (Lives on the `fix/lowerer-assert-zero-slot-collapse`
+  branch, commit `0438d52`.) When a value-bearing witness collided with the
+  circuit-wide `ZERO` slot, two ops became creators of the same witness and
+  unbalanced the global LogUp bus. **Why:** our IVC circuits hit this in the wild
+  and it made otherwise-correct folds reject. We offered it as **PR #452**, which
+  the owner *closed* — a maintainer's minimality critique was right, so it stays a
+  fork-local note rather than an upstream change.
+
+- **The constant-VK fixed-point / threaded publics** — the IVC orchestration that
+  keeps one circuit's VK constant across an unbounded fold and re-exposes public
+  inputs (head root, chain digest, turn count) across aggregation layers, plus the
+  `build_and_prove_*_layer_with_expose` plumbing and the `D=4/2/5` plugin
+  registrations. **Why:** this is the dregg-specific shape — *which* witnesses we
+  expose and *which* VK we pin — assembled out of the general pieces above. It's
+  the most fork-shaped part and is not offered upstream.
+
+### Honest status
+
+This fork's additions are **AI-developed and semi-unaudited**. They work in our
+testing — the IVC chain folds, the exposed outputs come back bound, the VK pin
+makes foreign children reject — but they have **not** been independently reviewed,
+and several touch soundness-relevant accounting (witness-slot creation, bus
+multiplicities, in-circuit VK binding). Treat them as "works in our testing," not
+"proven correct." The upstream caveat below applies here in full, doubly so for
+these pieces.
+
+The general capabilities are offered upstream where they're genuinely useful
+(PR #453 open for the public-output channel; PR #452 closed for the lowerer fix);
+everything dregg-shaped lives here, and that's fine.
+
+---
+
 ## Overview
 
 This library provides a **fixed recursive verifier** for Plonky3 STARK (both `p3-uni-stark` and `p3-batch-stark` proofs), allowing you to verify proofs inside circuits and compose proofs recursively. The recursive verifier is implemented as a circuit itself, which can be proven and verified in subsequent layers.
