@@ -299,12 +299,7 @@ impl<'a, F: Field> CircuitRunner<'a, F> {
                                 let b_val = b_set.unwrap();
                                 let out_val = out_set.unwrap();
                                 if a_val + b_val != out_val {
-                                    return Err(CircuitError::WitnessConflict {
-                                        witness_id: out,
-                                        existing: format!("{out_val:?}"),
-                                        new: format!("{:?}", a_val + b_val),
-                                        expr_ids: vec![],
-                                    });
+                                    return Err(self.witness_conflict(out, out_val, a_val + b_val));
                                 }
                                 alu_records.push(AluOpRecord {
                                     kind,
@@ -510,32 +505,37 @@ impl<'a, F: Field> CircuitRunner<'a, F> {
             if *existing_value == value {
                 return Ok(());
             }
-            #[cfg(feature = "debugging")]
-            let expr_ids = self
-                .circuit
-                .expr_to_widx
-                .iter()
-                .filter_map(|(expr_id, &witness_id)| {
-                    if witness_id == widx {
-                        Some(*expr_id)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            #[cfg(not(feature = "debugging"))]
-            let expr_ids = vec![];
-
-            return Err(CircuitError::WitnessConflict {
-                witness_id: widx,
-                existing: format!("{existing_value:?}"),
-                new: format!("{value:?}"),
-                expr_ids,
-            });
+            let existing_value = *existing_value;
+            return Err(self.witness_conflict(widx, existing_value, value));
         }
 
         *slot = Some(value);
         Ok(())
+    }
+
+    /// Build a `WitnessConflict` error localized to the expression(s) sharing `widx`.
+    ///
+    /// A `connect(x, c)` / `assert_zero(x)` unions `x` into a constant's witness slot (the
+    /// dominant case being the circuit-wide `ExprId::ZERO`/`WitnessId(0)`). When a forged or
+    /// inconsistent witness drives `x` to a value `≠ c`, the write to that shared slot fails
+    /// here — a correct rejection, but one whose raw `WitnessId` (often `0`) does not name the
+    /// offending expression. We scan `expr_to_widx` for every `ExprId` mapped to `widx` and
+    /// attach them, so the failure is self-localizing (equivalently:
+    /// `builder.dump_allocation_log()`). This runs ONLY on the error path — the run is already
+    /// aborting — so it adds no cost to honest witness generation.
+    fn witness_conflict(&self, widx: WitnessId, existing: F, new: F) -> CircuitError {
+        let expr_ids = self
+            .circuit
+            .expr_to_widx
+            .iter()
+            .filter_map(|(expr_id, &w)| (w == widx).then_some(*expr_id))
+            .collect::<Vec<_>>();
+        CircuitError::WitnessConflict {
+            witness_id: widx,
+            existing: format!("{existing:?}"),
+            new: format!("{new:?}"),
+            expr_ids,
+        }
     }
 
     /// Reference to the witness slice (for benchmarking trace builders after `execute_all`).
@@ -695,6 +695,46 @@ mod tests {
     }
 
     #[test]
+    // A VIOLATED `assert_zero(x)` aliases `x` into the circuit-wide zero slot `WitnessId(0)`;
+    // when the witness drives `x` nonzero the write to that shared slot is rejected (sound:
+    // a forged proof has no valid witness). The error must NAME the offending expression(s)
+    // mapped to the slot, so the conflict is diagnosable without re-running under a feature
+    // flag — the lightweight alternative to emitting a per-`assert_zero` equality row.
+    fn test_violated_assert_zero_rejects_and_localizes() {
+        let mut builder = CircuitBuilder::new();
+        let c37 = builder.define_const(BabyBear::from_u64(37));
+        let c111 = builder.define_const(BabyBear::from_u64(111));
+        let x_hint = XHint::new();
+        let x = builder
+            .push_unconstrained_op(vec![vec![c37, c111]], 1, x_hint, "x")
+            .2[0]
+            .unwrap();
+        let mul_result = builder.mul(c37, x);
+        // Assert `37*x - 110 == 0`, which is FALSE for the honest `x` (= 3): `37*3 - 110 = 1`.
+        let c110 = builder.define_const(BabyBear::from_u64(110));
+        let sub_result = builder.sub(mul_result, c110);
+        builder.assert_zero(sub_result);
+        let circuit = builder.build().unwrap();
+        let err = circuit.runner().run().unwrap_err();
+        match err {
+            CircuitError::WitnessConflict {
+                witness_id,
+                expr_ids,
+                ..
+            } => {
+                // The collapse routes through the shared zero slot.
+                assert_eq!(witness_id, WitnessId(0));
+                // ...and the failure names the expressions sharing it (self-localizing).
+                assert!(
+                    !expr_ids.is_empty(),
+                    "expected localized expr_ids, got {expr_ids:?}"
+                );
+            }
+            other => panic!("expected WitnessConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
     // Proves that we know x such that 37 * x - 111 = 0
     fn test_toy_example_37_times_x_minus_111() {
         init_logger();
@@ -721,25 +761,18 @@ mod tests {
 
         let f = BabyBear::from_u64;
         let neg_111 = -f(111);
-        // `assert_zero(sub_result)` is now a DEFERRED const-connect: `sub_result` keeps its OWN
-        // witness (W5, holding 0) instead of being aliased into the zero const's WitnessId(0),
-        // and a `MulAdd(sub_result, ZERO, ZERO, sub_result)` row (sub_result*0 + 0 == sub_result)
-        // binds it to zero. The negated const `-111` lands at W6. This is the sound representation
-        // that prevents the circuit-wide `WitnessId(0)` aliasing collapse.
+        // `assert_zero(sub_result)` lowers to `connect(sub_result, ExprId::ZERO)`, which unions
+        // `sub_result` into the zero constant's class — so `sub_result` shares `WitnessId(0)`.
+        // No extra row is emitted: the `Add` that computes `sub_result` targets the already-
+        // created `WitnessId(0)`, so on the WitnessChecks bus it is a READER of the zero slot,
+        // binding `sub_result == 0` as a bus equality (see `generate_preprocessed_columns`:
+        // `out_already_defined ⇒ out_is_creator = false`). The negated const `-111` lands at W5.
         assert_eq!(
             traces,
             Traces {
-                witness_trace: WitnessTrace::new(vec![
-                    f(0),
-                    f(37),
-                    f(111),
-                    f(3),
-                    f(111),
-                    f(0),
-                    neg_111
-                ]),
+                witness_trace: WitnessTrace::new(vec![f(0), f(37), f(111), f(3), f(111), neg_111]),
                 const_trace: ConstTrace {
-                    index: vec![WitnessId(0), WitnessId(1), WitnessId(2), WitnessId(6)],
+                    index: vec![WitnessId(0), WitnessId(1), WitnessId(2), WitnessId(5)],
                     values: vec![f(0), f(37), f(111), neg_111],
                 },
                 public_trace: PublicTrace {
@@ -747,16 +780,11 @@ mod tests {
                     values: vec![],
                 },
                 alu_trace: AluTrace {
-                    op_kind: vec![AluOpKind::Mul, AluOpKind::Add, AluOpKind::MulAdd],
-                    values: vec![
-                        [f(37), f(3), f(0), f(111)],
-                        [f(111), neg_111, f(0), f(0)],
-                        [f(0), f(0), f(0), f(0)],
-                    ],
+                    op_kind: vec![AluOpKind::Mul, AluOpKind::Add],
+                    values: vec![[f(37), f(3), f(0), f(111)], [f(111), neg_111, f(0), f(0)]],
                     indices: vec![
                         [WitnessId(1), WitnessId(3), WitnessId(0), WitnessId(4)],
-                        [WitnessId(4), WitnessId(6), WitnessId(0), WitnessId(5)],
-                        [WitnessId(5), WitnessId(0), WitnessId(0), WitnessId(5)],
+                        [WitnessId(4), WitnessId(5), WitnessId(0), WitnessId(0)],
                     ],
                 },
                 non_primitive_traces: HashMap::new(),
