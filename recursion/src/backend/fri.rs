@@ -123,6 +123,23 @@ pub struct FriRecursionBackend<
     /// Increasing this reduces the recompose table height proportionally.
     /// Must be kept in sync between prover and verifier. Defaults to 1.
     pub recompose_lanes: usize,
+    /// Force registration of the `recompose/coeff` table even when the challenger
+    /// permutation's extension degree equals the circuit degree `D`.
+    ///
+    /// Normally the `recompose/coeff` table is registered only when the challenger
+    /// operates in a different extension degree than the circuit (`cl = ext_degree != D`),
+    /// which is the configuration that emits `recompose/coeff` ops. When this flag is set,
+    /// the coeff table is additionally registered for the `ext_degree == D` case, so that a
+    /// circuit which reads 4 consecutive base lanes of one ext limb via
+    /// `decompose_ext_to_base_coeffs` (emitting `recompose/coeff` ops) balances on the
+    /// WitnessChecks bus.
+    ///
+    /// This is OPT-IN and defaults to `false`: with the flag off the backend is
+    /// byte-identical to the shared default (existing leaf VKs do not move). The
+    /// registered-but-unused coeff table is inert — like the isolated W24 segment-digest
+    /// prover, it matches no op and so contributes nothing to `non_primitives` /
+    /// the `recursion_vk_fingerprint` when no `recompose/coeff` op is present.
+    pub force_coeff_lookups: bool,
 }
 
 impl<const WIDTH: usize, const RATE: usize, C: ChallengerPermConfig>
@@ -133,12 +150,26 @@ impl<const WIDTH: usize, const RATE: usize, C: ChallengerPermConfig>
         Self {
             challenger_perm_config,
             recompose_lanes: 1,
+            force_coeff_lookups: false,
         }
     }
 
     /// Override the number of recompose operations packed per AIR row.
     pub const fn with_recompose_lanes(mut self, lanes: usize) -> Self {
         self.recompose_lanes = if lanes < 1 { 1 } else { lanes };
+        self
+    }
+
+    /// Opt in to registering the `recompose/coeff` table even when the challenger's
+    /// extension degree equals the circuit degree `D`.
+    ///
+    /// Use this when the circuit reads consecutive base lanes of one ext limb via
+    /// `decompose_ext_to_base_coeffs` (e.g. a custom in-circuit base sponge over
+    /// `WideHash::to_felts()[0..4]`) so the `recompose/coeff` ops balance on the
+    /// WitnessChecks bus. Inert and fingerprint-neutral when no such op is present;
+    /// see [`FriRecursionBackend::force_coeff_lookups`].
+    pub const fn with_coeff_lookups(mut self) -> Self {
+        self.force_coeff_lookups = true;
         self
     }
 
@@ -584,7 +615,7 @@ where
     }
 
     fn non_primitive_preprocessors(&self) -> Vec<Box<dyn NpoPreprocessor<Val<SC>>>> {
-        let cl = self.0.challenger_perm_config.extension_degree() != 2;
+        let cl = self.0.challenger_perm_config.extension_degree() != 2 || self.0.force_coeff_lookups;
         let perm_prep = if self.0.challenger_perm_config.as_poseidon1().is_some() {
             poseidon1_preprocessor::<Val<SC>>()
         } else {
@@ -599,7 +630,7 @@ where
 
     fn non_primitive_provers(&self, ext_degree: usize) -> Vec<Box<dyn TableProver<SC>>> {
         if ext_degree == 2 {
-            let cl = self.0.challenger_perm_config.extension_degree() != 2;
+            let cl = self.0.challenger_perm_config.extension_degree() != 2 || self.0.force_coeff_lookups;
             let mut provers: Vec<Box<dyn TableProver<SC>>> = match (
                 self.0.challenger_perm_config.as_poseidon1(),
                 self.0.challenger_perm_config.as_poseidon2(),
@@ -623,7 +654,7 @@ where
     }
 
     fn non_primitive_air_builders(&self) -> Vec<Box<dyn NpoAirBuilder<SC, 2>>> {
-        let cl = self.0.challenger_perm_config.extension_degree() != 2;
+        let cl = self.0.challenger_perm_config.extension_degree() != 2 || self.0.force_coeff_lookups;
         let mut builders = if self.0.challenger_perm_config.as_poseidon1().is_some() {
             poseidon1_air_builders::<SC, 2>()
         } else {
@@ -705,7 +736,7 @@ where
     }
 
     fn non_primitive_preprocessors(&self) -> Vec<Box<dyn NpoPreprocessor<Val<SC>>>> {
-        let cl = self.0.challenger_perm_config.extension_degree() != 4;
+        let cl = self.0.challenger_perm_config.extension_degree() != 4 || self.0.force_coeff_lookups;
         let perm_prep = if self.0.challenger_perm_config.as_poseidon1().is_some() {
             poseidon1_preprocessor::<Val<SC>>()
         } else {
@@ -720,7 +751,7 @@ where
 
     fn non_primitive_provers(&self, ext_degree: usize) -> Vec<Box<dyn TableProver<SC>>> {
         if ext_degree == 4 {
-            let cl = self.0.challenger_perm_config.extension_degree() != 4;
+            let cl = self.0.challenger_perm_config.extension_degree() != 4 || self.0.force_coeff_lookups;
             let mut provers: Vec<Box<dyn TableProver<SC>>> = match (
                 self.0.challenger_perm_config.as_poseidon1(),
                 self.0.challenger_perm_config.as_poseidon2(),
@@ -762,7 +793,7 @@ where
     }
 
     fn non_primitive_air_builders(&self) -> Vec<Box<dyn NpoAirBuilder<SC, 4>>> {
-        let cl = self.0.challenger_perm_config.extension_degree() != 4;
+        let cl = self.0.challenger_perm_config.extension_degree() != 4 || self.0.force_coeff_lookups;
         let mut builders = if self.0.challenger_perm_config.as_poseidon1().is_some() {
             poseidon1_air_builders::<SC, 4>()
         } else {
@@ -844,7 +875,7 @@ where
     }
 
     fn non_primitive_preprocessors(&self) -> Vec<Box<dyn NpoPreprocessor<Val<SC>>>> {
-        let cl = self.0.challenger_perm_config.extension_degree() != 5;
+        let cl = self.0.challenger_perm_config.extension_degree() != 5 || self.0.force_coeff_lookups;
         let perm_prep = if self.0.challenger_perm_config.as_poseidon1().is_some() {
             poseidon1_preprocessor::<Val<SC>>()
         } else {
@@ -859,7 +890,7 @@ where
 
     fn non_primitive_provers(&self, ext_degree: usize) -> Vec<Box<dyn TableProver<SC>>> {
         if ext_degree == 5 {
-            let cl = self.0.challenger_perm_config.extension_degree() != 5;
+            let cl = self.0.challenger_perm_config.extension_degree() != 5 || self.0.force_coeff_lookups;
             let mut provers = match (
                 self.0.challenger_perm_config.as_poseidon1(),
                 self.0.challenger_perm_config.as_poseidon2(),
@@ -877,7 +908,7 @@ where
     }
 
     fn non_primitive_air_builders(&self) -> Vec<Box<dyn NpoAirBuilder<SC, 5>>> {
-        let cl = self.0.challenger_perm_config.extension_degree() != 5;
+        let cl = self.0.challenger_perm_config.extension_degree() != 5 || self.0.force_coeff_lookups;
         let mut builders = if self.0.challenger_perm_config.as_poseidon1().is_some() {
             poseidon1_air_builders_d5()
         } else {

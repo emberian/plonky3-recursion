@@ -1,6 +1,7 @@
 //! Unified recursion API: one entry point to prove the next layer over a uni-stark or batch-stark proof.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
 use alloc::rc::Rc;
 use alloc::string::ToString;
 use alloc::vec;
@@ -8,9 +9,13 @@ use alloc::vec::Vec;
 
 use p3_air::{SymbolicExpression, SymbolicExpressionExt};
 use p3_batch_stark::{CommonData, ProverData};
+use p3_circuit::ops::{Poseidon2Config, Poseidon2PermCall};
 use p3_circuit::symbolic::ColumnsTargets;
 use p3_circuit::tables::Traces;
-use p3_circuit::{Circuit, CircuitBuilder, CircuitRunner, NonPrimitiveOpId};
+use p3_circuit::types::ExprId;
+use p3_circuit::{
+    Circuit, CircuitBuilder, CircuitBuilderError, CircuitRunner, NonPrimitiveOpId, NpoTypeId,
+};
 use p3_circuit_prover::batch_stark_prover::TableProver;
 use p3_circuit_prover::common::{NpoAirBuilder, NpoPreprocessor, get_airs_and_degrees_with_prep};
 use p3_circuit_prover::config::StarkField;
@@ -669,6 +674,352 @@ where
         params,
         None,
     )
+}
+
+/// The canonical proof shape that `normalize_to_shape` (Pickles `step ∘ wrap`)
+/// targets: the FIXED multiset of non-primitive table TYPES every normalized proof
+/// must carry, each at a FIXED lane count, plus the global minimum trace height all
+/// tables pad up to.
+///
+/// Two proofs normalized to the SAME `CanonicalShapeSpec` produce a BYTE-IDENTICAL
+/// recursive-verifier op-list / [`AggregationCircuitFingerprint`] regardless of their
+/// real table content: the HEIGHT axis (`min_trace_height` pads every table to a
+/// fixed power-of-two height) and the MANIFEST axis (every proof carries the same
+/// ordered non-primitive type set at fixed lanes) are both pinned. That invariance
+/// is exactly what lets ONE static VK verify any child of this shape. Both axes are
+/// de-risked green in `recursion/tests/normalize_to_shape_spike.rs`
+/// (`fingerprint_invariant_under_fixed_shape_padding` for height,
+/// `fingerprint_invariant_under_fixed_manifest_padding` for the manifest).
+#[derive(Clone, Debug)]
+pub struct CanonicalShapeSpec {
+    /// log2 of the fixed trace height every table is padded to (`min_trace_height = 1 << log_height`).
+    pub log_height: usize,
+    /// Fixed primitive public-table lane count.
+    pub public_lanes: usize,
+    /// Fixed primitive ALU-table lane count.
+    pub alu_lanes: usize,
+    /// The canonical non-primitive manifest: each `(type, lanes)` is one table TYPE
+    /// EVERY normalized proof carries, at its fixed lane count. A child that does not
+    /// naturally use a canonical type is padded with a MINIMAL SATISFIABLE instance of
+    /// it (e.g. a one-claim `expose_claim`, or a self-balanced minimal
+    /// poseidon2/recompose) injected at child-build time.
+    pub canonical_npos: Vec<(NpoTypeId, usize)>,
+}
+
+impl CanonicalShapeSpec {
+    /// Build the [`TablePacking`] that pins this canonical shape: the fixed
+    /// `min_trace_height` plus every canonical NPO's fixed lane override. This is the
+    /// real, load-bearing canonical-shape construction — it is what makes both the
+    /// height and manifest axes invariant.
+    pub fn to_table_packing(&self) -> TablePacking {
+        let mut packing = TablePacking::new(self.public_lanes, self.alu_lanes)
+            .with_min_trace_height(1usize << self.log_height);
+        for (op_type, lanes) in &self.canonical_npos {
+            packing = packing.with_npo_lanes(op_type.clone(), *lanes);
+        }
+        packing
+    }
+
+    /// The canonical layer params (pinned packing + standard profile).
+    pub fn to_params(&self) -> ProveNextLayerParams {
+        ProveNextLayerParams {
+            table_packing: self.to_table_packing(),
+            constraint_profile: ConstraintProfile::Standard,
+        }
+    }
+
+    /// The canonical depth-1 manifest — the SINGLE source of truth for the ordered
+    /// non-primitive type set a depth-1 fixed VK pins: `[poseidon2_perm, recompose,
+    /// expose_claim]`, each at `lanes` lanes. These three are exactly the canonical
+    /// types proven lookup-balanced as minimal fillers AND fingerprint-invariant
+    /// (a uses-all-three child vs a padded-from-none child compile to a byte-identical
+    /// recursive-verifier op-list) by the D=4 full-manifest tests in
+    /// `recursion/tests/normalize_to_shape_spike.rs`. `inject_canonical_fillers` pads
+    /// an absent type to exactly this manifest at child-build time.
+    pub fn depth1_default(
+        log_height: usize,
+        public_lanes: usize,
+        alu_lanes: usize,
+        poseidon2_config: Poseidon2Config,
+        lanes: usize,
+    ) -> Self {
+        Self {
+            log_height,
+            public_lanes,
+            alu_lanes,
+            canonical_npos: alloc::vec![
+                (NpoTypeId::poseidon2_perm(poseidon2_config), lanes),
+                (NpoTypeId::recompose(), lanes),
+                (NpoTypeId::expose_claim(), lanes),
+            ],
+        }
+    }
+}
+
+/// Inject a minimal SELF-BALANCED filler for every canonical non-primitive type in
+/// `canonical_npos` that is ABSENT from `present`, at child-BUILD time, so the child
+/// lands on the full canonical manifest a depth-1 fixed VK re-verifies.
+///
+/// This is the REAL `normalize_to_shape` padding op: the constructions below are the
+/// ones proven lookup-balanced (each filler proves with the lookup debugger ON, and
+/// the padded tables are genuinely present in `proof.non_primitives`) AND
+/// fingerprint-invariant against a child that uses all three types for real, by the
+/// D=4 full-manifest tests in `recursion/tests/normalize_to_shape_spike.rs`.
+///
+/// Per canonical type (each self-balanced on the buses it touches):
+/// * `poseidon2_perm` — one permutation over two `Const` rate inputs with `out_ctl`
+///   all false. A permutation CTL-RECEIVES its rate inputs and CTL-SENDS its rate
+///   outputs; with no CTL'd output it sends nothing on the hash bus and only receives
+///   the consts (balanced by the Const table's send). Self-balanced, no companion.
+/// * `recompose` — `decompose_ext_to_base_coeffs(bind)` emits exactly one recompose
+///   row whose EF-output SEND is `connect`-bound straight back to `bind`, so it is
+///   consumed by `bind`'s existing readers. Self-balanced when `bind` is a genuine
+///   NON-CONST extension witness (a const `bind` would const-fold away the row).
+/// * `expose_claim` — `expose_as_public_output(&[bind])`: the `WitnessChecks` read is
+///   balanced by the `PublicAir` send.
+///
+/// Contract: `builder` must already have the canonical NPOs ENABLED, and `bind` must
+/// be a genuine already-present NON-CONST extension witness of the child (e.g. a
+/// public input or a hash output) for the recompose + expose fillers to bind to. A
+/// CONST `bind` const-folds the decompose away and emits NO recompose table, leaving
+/// the requested canonical entry absent — so `bind` must be a real witness.
+///
+/// This function OWNS the `set_recompose_coeff_ctl_for_decompose_links` switch for the
+/// duration of its recompose fillers: it pins the route per canonical type
+/// (`recompose` ⇒ OFF, `recompose/coeff` ⇒ ON) so the emitted table is exactly the
+/// requested one regardless of the builder's incoming flag state, and leaves the flag
+/// at its constructor default (OFF) on return. A caller that needs the coeff route for
+/// its own later ops must set it again after this call.
+pub fn inject_canonical_fillers<CF, BF>(
+    builder: &mut CircuitBuilder<CF>,
+    poseidon2_config: Poseidon2Config,
+    canonical_npos: &[(NpoTypeId, usize)],
+    present: &BTreeSet<&str>,
+    bind: ExprId,
+) -> Result<(), CircuitBuilderError>
+where
+    CF: Field + ExtensionField<BF>,
+    BF: PrimeField64,
+{
+    for (op_type, _) in canonical_npos {
+        let name = op_type.as_str();
+        if present.contains(name) {
+            continue;
+        }
+        if name.starts_with("poseidon2_perm") {
+            let c0 = builder.alloc_const(CF::from_u64(7), "canonical_filler_p2_in0");
+            let c1 = builder.alloc_const(CF::from_u64(11), "canonical_filler_p2_in1");
+            let mut inputs = alloc::vec![None; poseidon2_config.width_ext()];
+            inputs[0] = Some(c0);
+            inputs[1] = Some(c1);
+            builder.add_poseidon2_perm(&Poseidon2PermCall {
+                config: poseidon2_config,
+                new_start: true,
+                merkle_path: false,
+                mmcs_bit: None,
+                inputs,
+                out_ctl: alloc::vec![false; poseidon2_config.rate_ext()],
+                return_all_outputs: false,
+                mmcs_index_sum: None,
+            })?;
+        } else if name == "recompose" {
+            // Plain `recompose`: decompose reconnects via the standard recompose table.
+            // Force the coeff-CTL route OFF so an incoming `true` flag cannot silently
+            // turn this filler into a `recompose/coeff` table (the symmetric footgun of
+            // the `recompose/coeff` case below). Restore the default (OFF) after.
+            builder.set_recompose_coeff_ctl_for_decompose_links(false);
+            let coeffs = builder.decompose_ext_to_base_coeffs::<BF>(bind)?;
+            debug_assert!(
+                !coeffs.is_empty(),
+                "decompose must emit a non-empty coefficient vector"
+            );
+        } else if name == "recompose/coeff" {
+            // `decompose_ext_to_base_coeffs` emits a `recompose/coeff` table ONLY when
+            // the coeff-CTL route is enabled; with the default builder state it silently
+            // emits a plain `recompose` instead, leaving the requested `recompose/coeff`
+            // canonical entry ABSENT. Set the flag OURSELVES so the caller cannot get a
+            // silent wrong table, then restore the default (OFF).
+            //
+            // The authoritative confirmation that the EMITTED op is `recompose/coeff`
+            // (not `recompose`) is the proof manifest: a child built through this path
+            // carries a `recompose/coeff` entry in `proof.non_primitives` (asserted in
+            // `recursion/tests/normalize_to_shape_spike.rs`). There is no public builder
+            // accessor to introspect the just-emitted op type in-place; the flag pin is
+            // what makes the path deterministic, and `bind` being a genuine non-const
+            // witness (the contract above) is what makes a table emit at all.
+            builder.set_recompose_coeff_ctl_for_decompose_links(true);
+            let coeffs = builder.decompose_ext_to_base_coeffs::<BF>(bind)?;
+            builder.set_recompose_coeff_ctl_for_decompose_links(false);
+            debug_assert!(
+                !coeffs.is_empty(),
+                "decompose must emit a non-empty coefficient vector"
+            );
+        } else if name == "expose_claim" {
+            builder.expose_as_public_output(&[bind]);
+        }
+    }
+    Ok(())
+}
+
+/// Verify a [`BatchStarkProof`] matches EXACTLY the canonical shape `spec` pins, so the
+/// recursion VK this proof is later checked against is the canonical one.
+///
+/// The in-circuit batch-STARK verifier ([`crate::verifier::verify_p3_batch_proof_circuit`])
+/// is DATA-DRIVEN by the proof: it reads `proof.table_packing` (public/ALU lanes, min trace
+/// height, Horner packing, per-NPO lanes) and walks the full ordered `proof.non_primitives`
+/// manifest, pushing one `CircuitTablesAir::Dynamic` AND one public-input slot per entry.
+/// So ANY divergence from the canonical shape — an EXTRA non-primitive table, a MISSING
+/// canonical table, a WRONG lane count, or different packing metadata — produces a DIFFERENT
+/// verifier op-list and hence a DIFFERENT VK. A name-only "all required types are present"
+/// check is therefore NOT sound: a proof with an extra table or wrong lanes passes it yet
+/// mismatches the canonical VK.
+///
+/// This is the fail-closed gate. It pins exactly the spec-derivable, VK-driving axes:
+/// 1. `proof.table_packing == spec.to_table_packing()` — the packing the verifier reads.
+/// 2. `proof.non_primitives`, as an exact MULTISET of `(op_type, lanes)`, equals
+///    `spec.canonical_npos` — no extra, no missing, no wrong-lane entry.
+///
+/// RESIDUAL (precisely): the verifier op-list ALSO depends on per-entry quantities the
+/// current [`CanonicalShapeSpec`] does not encode — each entry's `public_values.len()`
+/// (it pushes one `air_public_counts` slot of that width) and `air_variant`, plus the
+/// proof-global `alu_variant` / `alu_quintic_trinomial` / `w_binomial`. For the canonical
+/// fillers these are fixed by construction (the `poseidon2`/`recompose` fillers expose 0
+/// public values, the `expose_claim` filler exposes 1), but a proof that matches the
+/// manifest+packing yet carries, e.g., a 5-claim `expose_claim` would pass THIS check and
+/// still induce a different VK. Fully closing that gap needs `CanonicalShapeSpec` to also
+/// carry the canonical per-entry public-value counts (and air variants), or this check to
+/// compare against a stored canonical verifier-circuit fingerprint / VK. The
+/// logical-row-count axis is NOT a gap: the spike's fixed-height invariance tests show the
+/// verifier op-list is invariant to primitive/NPO logical row counts once the height
+/// (`min_trace_height`, pinned by axis 1) is fixed.
+pub fn check_canonical_shape<SC>(
+    proof: &BatchStarkProof<SC>,
+    spec: &CanonicalShapeSpec,
+) -> Result<(), VerificationError>
+where
+    SC: StarkGenericConfig,
+{
+    // Axis 1: the primitive packing the verifier reads must match the canonical packing.
+    // We compare the VK-driving SCALARS explicitly (rather than `TablePacking == `): the
+    // stored `public_lanes`/`alu_lanes` are the EFFECTIVE (post prove-time clamp) values
+    // the verifier actually uses, and `npo_lanes` is an order-sensitive Vec covered by the
+    // per-entry lane check in axis 2 — so a scalar comparison is both order-free and the
+    // honest VK pin. The verifier builds `PublicAir::new(rows, public_lanes)` /
+    // `AluAir::…(alu_lanes, …, horner)` and pads every table to `min_trace_height`.
+    let canonical_packing = spec.to_table_packing();
+    let p = &proof.table_packing;
+    if p.public_lanes() != canonical_packing.public_lanes()
+        || p.alu_lanes() != canonical_packing.alu_lanes()
+        || p.min_trace_height() != canonical_packing.min_trace_height()
+        || p.horner_packed_steps() != canonical_packing.horner_packed_steps()
+    {
+        return Err(proof_shape_err(&alloc::format!(
+            "prev packing (public_lanes={}, alu_lanes={}, min_trace_height={}, \
+             horner_packed_steps={}) does not match the canonical packing (public_lanes={}, \
+             alu_lanes={}, min_trace_height={}, horner_packed_steps={}); the verifier \
+             op-list (VK) is driven by the packing, so an off-canonical packing would be \
+             checked against a different VK",
+            p.public_lanes(),
+            p.alu_lanes(),
+            p.min_trace_height(),
+            p.horner_packed_steps(),
+            canonical_packing.public_lanes(),
+            canonical_packing.alu_lanes(),
+            canonical_packing.min_trace_height(),
+            canonical_packing.horner_packed_steps(),
+        )));
+    }
+
+    // Axis 2: the non-primitive manifest must be EXACTLY the canonical multiset of
+    // (op_type, lanes). Length-equal + an injective consume ⇒ a bijection, so this rejects
+    // any extra table, any missing canonical table, and any wrong-lane entry.
+    if proof.non_primitives.len() != spec.canonical_npos.len() {
+        return Err(proof_shape_err(&alloc::format!(
+            "prev carries {} non-primitive table(s) but the canonical manifest pins {}; \
+             run `inject_canonical_fillers` at child-build time so the child lands on the \
+             exact canonical manifest before normalizing",
+            proof.non_primitives.len(),
+            spec.canonical_npos.len()
+        )));
+    }
+    let mut remaining: Vec<(NpoTypeId, usize)> = spec.canonical_npos.clone();
+    for entry in &proof.non_primitives {
+        match remaining
+            .iter()
+            .position(|(t, l)| *t == entry.op_type && *l == entry.lanes)
+        {
+            Some(pos) => {
+                remaining.swap_remove(pos);
+            }
+            None => {
+                return Err(proof_shape_err(&alloc::format!(
+                    "prev carries non-primitive table `{}` at {} lane(s), which is not in \
+                     the canonical manifest at that lane count (extra table / wrong lanes); \
+                     a mismatched manifest yields a different verifier VK",
+                    entry.op_type, entry.lanes
+                )));
+            }
+        }
+    }
+    debug_assert!(remaining.is_empty(), "bijection: remaining must be empty");
+    Ok(())
+}
+
+/// Build + prove ONE normalization layer: verify `prev` with a recursion circuit whose
+/// shape is pinned to the canonical `spec`, producing a next-layer proof in canonical
+/// shape so a single fixed VK can verify it (the Pickles `step ∘ wrap` normalization).
+///
+/// The canonical-shape construction is REAL: [`CanonicalShapeSpec::to_params`] pins the
+/// fixed height (`min_trace_height`) and the fixed per-type manifest lanes, and the
+/// recursion verifier circuit is built + proved against that pinned packing via the
+/// existing [`build_and_prove_next_layer`] pipeline.
+///
+/// REQUIREMENT: `prev` must ALREADY be a proof built in canonical shape — i.e. a child
+/// constructed with [`inject_canonical_fillers`] (the child-BUILD-time op that pads every
+/// absent canonical NPO type with a minimal self-balanced instance) and proved against
+/// `spec.to_table_packing()`. Manifest padding is a child-build-time operation, not a
+/// fold-time one: a finished proof's table set is immutable, so this layer (which receives
+/// `prev` as an already-proved [`BatchStarkProof`]) CANNOT add a missing table to it.
+///
+/// This layer is therefore FAIL-CLOSED: it runs the exact-shape precondition
+/// [`check_canonical_shape`] against `prev`, which REJECTS any proof that is missing a
+/// canonical table, carries an extra non-primitive table, has a wrong lane count, or has
+/// off-canonical packing — anything that would not land on the canonical VK. A proof that
+/// would silently mismatch the fixed VK is rejected here with a loud `Err`, never folded.
+/// See [`check_canonical_shape`] for the precisely-stated residual (per-entry
+/// `public_values.len()` / `air_variant` are not yet spec-encoded).
+pub fn build_and_prove_normalization_layer<SC, A, B, const D: usize>(
+    prev: &RecursionInput<'_, SC, A>,
+    config: &SC,
+    backend: &B,
+    spec: &CanonicalShapeSpec,
+) -> Result<RecursionOutput<SC>, VerificationError>
+where
+    SC: StarkGenericConfig + Send + Sync + Clone + 'static,
+    A: RecursiveAir<Val<SC>, SC::Challenge, LogUpGadget>,
+    B: PcsRecursionBackend<SC, A, D>,
+    Val<SC>: PrimeField64 + StarkField,
+    SC::Challenge: BasedVectorSpace<Val<SC>>
+        + From<Val<SC>>
+        + ExtensionField<Val<SC>>
+        + ExtractBinomialW<Val<SC>>,
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>:
+        Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
+{
+    // The real canonical-shape construction: fixed height + fixed manifest lanes.
+    let params = spec.to_params();
+
+    // EXACT-SHAPE precondition (fail-closed): `prev` must already carry the canonical
+    // packing AND the exact canonical non-primitive manifest. The absent-type filler is
+    // injected at child-build time by `inject_canonical_fillers` (an already-proved
+    // proof's table set is immutable — see the function doc); here we REJECT any proof
+    // that does not land on the canonical shape the fixed VK expects, so a mismatched
+    // proof can never be folded against the wrong VK.
+    if let RecursionInput::BatchStark { proof, .. } = prev {
+        check_canonical_shape::<SC>(proof, spec)?;
+    }
+
+    build_and_prove_next_layer::<SC, A, B, D>(prev, config, backend, &params)
 }
 
 /// Build a 2-to-1 aggregation layer verifier circuit.
