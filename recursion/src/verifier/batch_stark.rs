@@ -1255,7 +1255,14 @@ where
         circuit.connect(folded_mul, quotient);
 
         // Check that the global lookup cumulative values accumulate to the expected value.
-        let mut global_cumulative = HashMap::<&String, Vec<_>>::new();
+        //
+        // DETERMINISM: this loop EMITS circuit ops per global-lookup name, so its iteration
+        // order is VK-significant (row allocation / dedup / fusion downstream all depend on
+        // op order). A HashMap here made the verifier op-list — and hence the recursion VK
+        // fingerprint — nondeterministic across builds (hashbrown's per-instance seed varies
+        // even within one process). Use a BTreeMap so names are visited in lexicographic
+        // order, always.
+        let mut global_cumulative = alloc::collections::BTreeMap::<&String, Vec<_>>::new();
         for data in global_lookup_data.iter().flatten() {
             global_cumulative
                 .entry(&data.name)

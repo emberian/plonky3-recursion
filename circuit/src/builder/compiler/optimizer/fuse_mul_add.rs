@@ -281,7 +281,13 @@ impl<F: Field> MulAddFusion<F> {
         let mut consumed_adds = hashbrown::HashSet::new();
         let mut mul_replacements: HashMap<usize, Op<F>> = HashMap::new();
 
-        for &add_idx in valid {
+        // DETERMINISM: iterate the valid set in ascending op order. The `mul_replacements`
+        // first-wins guard below means set-iteration order could otherwise decide which
+        // fusion lands, and op-list content is VK-significant downstream.
+        let mut valid_sorted: Vec<usize> = valid.iter().copied().collect();
+        valid_sorted.sort_unstable();
+
+        for add_idx in valid_sorted {
             if let Some((mul_idx, muladd, _)) = candidates.remove(&add_idx)
                 && !mul_replacements.contains_key(&mul_idx)
             {
