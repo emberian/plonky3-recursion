@@ -119,8 +119,18 @@ where
     },
 }
 
-/// Output of one recursion step: the next-layer batch proof and its prover data (for chaining or verification).
-pub struct RecursionOutput<SC>(pub BatchStarkProof<SC>, pub Rc<CircuitProverData<SC>>)
+/// Output of one recursion step: the next-layer batch proof and optional local
+/// prover data.
+///
+/// The proof is self-contained for verification and for building the next
+/// recursion input: both paths read `proof.stark_common` directly.  The prover
+/// data is therefore an optimization cache, not part of the recursive proof
+/// currency.  GPU/remote workers may omit it instead of rebuilding a
+/// CPU-typed preprocessed commitment merely to cross a config/type boundary.
+pub struct RecursionOutput<SC>(
+    pub BatchStarkProof<SC>,
+    pub Option<Rc<CircuitProverData<SC>>>,
+)
 where
     SC: StarkGenericConfig;
 
@@ -560,7 +570,7 @@ where
             .map_err(|e| proof_shape_err(&e.to_string()))?;
         return Ok(RecursionOutput(
             proof,
-            Rc::clone(&cached.circuit_prover_data),
+            Some(Rc::clone(&cached.circuit_prover_data)),
         ));
     }
 
@@ -616,7 +626,7 @@ where
         .prove_all_tables(&traces, &circuit_prover_data)
         .map_err(|e| proof_shape_err(&e.to_string()))?;
 
-    Ok(RecursionOutput(proof, Rc::new(circuit_prover_data)))
+    Ok(RecursionOutput(proof, Some(Rc::new(circuit_prover_data))))
 }
 
 /// Convenience wrapper that calls [`build_next_layer_circuit`] then [`prove_next_layer`] without a prep cache.
@@ -677,9 +687,9 @@ where
 }
 
 /// The canonical proof shape that `normalize_to_shape` (Pickles `step ∘ wrap`)
-/// targets: the FIXED multiset of non-primitive table TYPES every normalized proof
-/// must carry, each at a FIXED lane count, plus the global minimum trace height all
-/// tables pad up to.
+/// targets: the FIXED ORDERED list of non-primitive table entries every normalized proof
+/// must carry, each at a FIXED lanes/rows/public-arity, plus the global minimum trace height
+/// all tables pad up to and the global ALU selectors.
 ///
 /// Two proofs normalized to the SAME `CanonicalShapeSpec` produce a BYTE-IDENTICAL
 /// recursive-verifier op-list / [`AggregationCircuitFingerprint`] regardless of their
@@ -690,6 +700,33 @@ where
 /// de-risked green in `recursion/tests/normalize_to_shape_spike.rs`
 /// (`fingerprint_invariant_under_fixed_shape_padding` for height,
 /// `fingerprint_invariant_under_fixed_manifest_padding` for the manifest).
+/// One entry of the canonical non-primitive manifest: the FULL set of per-table quantities
+/// the in-circuit batch-STARK verifier op-list (hence the VK) depends on.
+///
+/// [`crate::verifier::verify_p3_batch_proof_circuit`] walks `proof.non_primitives` IN ORDER
+/// and, per entry: (1) selects the plugin by `op_type`; (2) builds its AIR via
+/// `TableProver::batch_air_from_table_entry`, which reads `lanes` (e.g. the recompose AIR
+/// width) and `rows` (e.g. the `expose_claim` AIR width is `num_claims = rows`, so the claim
+/// count is structural — a 1-claim vs 2-claim `expose_claim` is a DIFFERENT AIR); and
+/// (3) pushes one `air_public_counts` slot of width `public_values.len()`. `air_variant` is
+/// the per-table AIR-variant hook a plugin may branch on. Two proofs whose ORDERED manifests
+/// agree on ALL of these fields compile to a BYTE-IDENTICAL verifier op-list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalNpoEntry {
+    /// Non-primitive operation type (selects the verifier plugin).
+    pub op_type: NpoTypeId,
+    /// Lane count (lanes packed per AIR row); drives e.g. the recompose AIR width.
+    pub lanes: usize,
+    /// Logical operation count for this table; structural for `expose_claim`
+    /// (`num_claims = rows` → AIR width). Pinned to the canonical filler's count.
+    pub rows: usize,
+    /// Number of public values this table exposes; pushed as one `air_public_counts`
+    /// slot of this width, so it sizes the verifier's public-input allocation.
+    pub public_values_len: usize,
+    /// Per-table AIR variant (the prover stamps `AirVariant::Baseline` for every NPO today).
+    pub air_variant: AirVariant,
+}
+
 #[derive(Clone, Debug)]
 pub struct CanonicalShapeSpec {
     /// log2 of the fixed trace height every table is padded to (`min_trace_height = 1 << log_height`).
@@ -698,12 +735,22 @@ pub struct CanonicalShapeSpec {
     pub public_lanes: usize,
     /// Fixed primitive ALU-table lane count.
     pub alu_lanes: usize,
-    /// The canonical non-primitive manifest: each `(type, lanes)` is one table TYPE
-    /// EVERY normalized proof carries, at its fixed lane count. A child that does not
-    /// naturally use a canonical type is padded with a MINIMAL SATISFIABLE instance of
-    /// it (e.g. a one-claim `expose_claim`, or a self-balanced minimal
-    /// poseidon2/recompose) injected at child-build time.
-    pub canonical_npos: Vec<(NpoTypeId, usize)>,
+    /// The proof-global primitive-ALU variant the verifier reads (`proof.alu_variant`) to
+    /// select the ALU AIR. Pinned because an off-canonical variant could induce a different
+    /// ALU AIR / VK.
+    pub alu_variant: AirVariant,
+    /// The proof-global quintic-trinomial flag (`proof.alu_quintic_trinomial`); at
+    /// `ext_degree == 5` it switches the ALU AIR to the quintic reduction, so it drives the
+    /// op-list. (At `ext_degree == 4` the verifier takes the binomial branch regardless, but
+    /// it is pinned for exactness across degrees.)
+    pub alu_quintic_trinomial: bool,
+    /// The canonical non-primitive manifest as an ORDERED list — the verifier walks
+    /// `proof.non_primitives` in order, so order is VK-significant. Each [`CanonicalNpoEntry`]
+    /// is one table EVERY normalized proof carries at its fixed lanes/rows/public-arity. A
+    /// child that does not naturally use a canonical type is padded with a MINIMAL SATISFIABLE
+    /// instance of it (e.g. a one-claim `expose_claim`, or a self-balanced minimal
+    /// poseidon2/recompose) injected at child-build time by [`inject_canonical_fillers`].
+    pub canonical_npos: Vec<CanonicalNpoEntry>,
 }
 
 impl CanonicalShapeSpec {
@@ -714,10 +761,19 @@ impl CanonicalShapeSpec {
     pub fn to_table_packing(&self) -> TablePacking {
         let mut packing = TablePacking::new(self.public_lanes, self.alu_lanes)
             .with_min_trace_height(1usize << self.log_height);
-        for (op_type, lanes) in &self.canonical_npos {
-            packing = packing.with_npo_lanes(op_type.clone(), *lanes);
+        for entry in &self.canonical_npos {
+            packing = packing.with_npo_lanes(entry.op_type.clone(), entry.lanes);
         }
         packing
+    }
+
+    /// The `(op_type, lanes)` manifest in canonical order — the slice
+    /// [`inject_canonical_fillers`] consumes (it pads an absent type by `op_type`).
+    pub fn npo_manifest(&self) -> Vec<(NpoTypeId, usize)> {
+        self.canonical_npos
+            .iter()
+            .map(|e| (e.op_type.clone(), e.lanes))
+            .collect()
     }
 
     /// The canonical layer params (pinned packing + standard profile).
@@ -747,10 +803,42 @@ impl CanonicalShapeSpec {
             log_height,
             public_lanes,
             alu_lanes,
+            // Canonical depth-1 primitive-ALU globals: the prover stamps `Optimized` for the
+            // ALU variant, and a D=4 depth-1 proof is never the quintic branch.
+            alu_variant: AirVariant::Optimized,
+            alu_quintic_trinomial: false,
+            // Per-entry quantities the prover stamps for the minimal canonical fillers (all
+            // VK-driving — see `CanonicalNpoEntry`). `expose_claim` exposes one public value
+            // (its one claim); `poseidon2_perm`/`recompose` expose none; every NPO carries
+            // `AirVariant::Baseline`. The `rows` convention is PLUGIN-INTERNAL and NOT uniform:
+            // the poseidon2 plugin reports its PADDED trace height (`= min_trace_height = 1 <<
+            // log_height`), while recompose and expose_claim report the LOGICAL op count (1 for
+            // the single-instance fillers). `rows` is op-list-relevant for `expose_claim` (its
+            // AIR width is `num_claims = rows`); for poseidon2/recompose pinning it is a
+            // conservative tie to the prover's stamp. `depth1_default_accepts_canonical_child`
+            // guards these exact values against a real proof.
             canonical_npos: alloc::vec![
-                (NpoTypeId::poseidon2_perm(poseidon2_config), lanes),
-                (NpoTypeId::recompose(), lanes),
-                (NpoTypeId::expose_claim(), lanes),
+                CanonicalNpoEntry {
+                    op_type: NpoTypeId::poseidon2_perm(poseidon2_config),
+                    lanes,
+                    rows: 1usize << log_height,
+                    public_values_len: 0,
+                    air_variant: AirVariant::Baseline,
+                },
+                CanonicalNpoEntry {
+                    op_type: NpoTypeId::recompose(),
+                    lanes,
+                    rows: 1,
+                    public_values_len: 0,
+                    air_variant: AirVariant::Baseline,
+                },
+                CanonicalNpoEntry {
+                    op_type: NpoTypeId::expose_claim(),
+                    lanes,
+                    rows: 1,
+                    public_values_len: 1,
+                    air_variant: AirVariant::Baseline,
+                },
             ],
         }
     }
@@ -874,24 +962,29 @@ where
 /// check is therefore NOT sound: a proof with an extra table or wrong lanes passes it yet
 /// mismatches the canonical VK.
 ///
-/// This is the fail-closed gate. It pins exactly the spec-derivable, VK-driving axes:
-/// 1. `proof.table_packing == spec.to_table_packing()` — the packing the verifier reads.
-/// 2. `proof.non_primitives`, as an exact MULTISET of `(op_type, lanes)`, equals
-///    `spec.canonical_npos` — no extra, no missing, no wrong-lane entry.
+/// This is the fail-closed gate. It pins EXACTLY the quantities the verifier op-list reads —
+/// every axis below was verified against `verify_p3_batch_proof_circuit` + `create_alu_air` +
+/// the per-plugin `batch_air_from_table_entry` / `ExposeClaimAir` / `RecomposeAir`:
+/// 1. PACKING: `public_lanes`, `alu_lanes`, `min_trace_height`, `horner_packed_steps` — the
+///    scalars the verifier reads to size `PublicAir`/`AluAir` and to pad every table.
+/// 2. GLOBAL ALU: `proof.alu_variant` (selects the ALU AIR) and `proof.alu_quintic_trinomial`
+///    (switches the ALU AIR to the quintic reduction at `ext_degree == 5`).
+/// 3. NON-PRIMITIVE MANIFEST, as an ORDERED list (NOT a multiset): the verifier walks
+///    `proof.non_primitives` in order, pushing one `CircuitTablesAir::Dynamic` + one
+///    `air_public_counts` slot per entry, so order is VK-significant. Per entry it pins
+///    `op_type`, `lanes`, `rows` (e.g. `expose_claim`'s AIR width is `num_claims = rows`),
+///    `public_values.len()` (the `air_public_counts` slot width), and `air_variant`.
 ///
-/// RESIDUAL (precisely): the verifier op-list ALSO depends on per-entry quantities the
-/// current [`CanonicalShapeSpec`] does not encode — each entry's `public_values.len()`
-/// (it pushes one `air_public_counts` slot of that width) and `air_variant`, plus the
-/// proof-global `alu_variant` / `alu_quintic_trinomial` / `w_binomial`. For the canonical
-/// fillers these are fixed by construction (the `poseidon2`/`recompose` fillers expose 0
-/// public values, the `expose_claim` filler exposes 1), but a proof that matches the
-/// manifest+packing yet carries, e.g., a 5-claim `expose_claim` would pass THIS check and
-/// still induce a different VK. Fully closing that gap needs `CanonicalShapeSpec` to also
-/// carry the canonical per-entry public-value counts (and air variants), or this check to
-/// compare against a stored canonical verifier-circuit fingerprint / VK. The
-/// logical-row-count axis is NOT a gap: the spike's fixed-height invariance tests show the
-/// verifier op-list is invariant to primitive/NPO logical row counts once the height
-/// (`min_trace_height`, pinned by axis 1) is fixed.
+/// Together these are the COMPLETE set of op-list inputs, so this check is EXACT: a proof that
+/// passes compiles to the canonical verifier circuit, and any non-canonical proof is rejected.
+/// Two residuals are NOT gaps: (a) `proof.ext_degree` is enforced upstream by the verifier's
+/// `assert_eq!(proof.ext_degree, TRACE_D)` (the layer's const generic), and (b) `proof.w_binomial`
+/// does NOT drive the in-circuit op-list — the recursive verifier derives the ALU's binomial `W`
+/// from the field (`EF::extract_w()` in `binomial_w_for_alu`), not from the proof; `w_binomial` is
+/// read only by the NATIVE prover-side `verify_all_tables` path. The primitive/NPO LOGICAL
+/// row-count axis is likewise invariant once `min_trace_height` is fixed (the spike's fixed-height
+/// invariance tests) — the ONE structural row quantity, `expose_claim`'s `num_claims`, is pinned
+/// explicitly by axis 3's `rows`.
 pub fn check_canonical_shape<SC>(
     proof: &BatchStarkProof<SC>,
     spec: &CanonicalShapeSpec,
@@ -903,7 +996,7 @@ where
     // We compare the VK-driving SCALARS explicitly (rather than `TablePacking == `): the
     // stored `public_lanes`/`alu_lanes` are the EFFECTIVE (post prove-time clamp) values
     // the verifier actually uses, and `npo_lanes` is an order-sensitive Vec covered by the
-    // per-entry lane check in axis 2 — so a scalar comparison is both order-free and the
+    // ordered per-entry lane check in axis 3 — so a scalar comparison is both order-free and the
     // honest VK pin. The verifier builds `PublicAir::new(rows, public_lanes)` /
     // `AluAir::…(alu_lanes, …, horner)` and pads every table to `min_trace_height`.
     let canonical_packing = spec.to_table_packing();
@@ -930,9 +1023,29 @@ where
         )));
     }
 
-    // Axis 2: the non-primitive manifest must be EXACTLY the canonical multiset of
-    // (op_type, lanes). Length-equal + an injective consume ⇒ a bijection, so this rejects
-    // any extra table, any missing canonical table, and any wrong-lane entry.
+    // Axis 2: the proof-global ALU AIR selectors the verifier reads. `create_alu_air`
+    // branches on `proof.alu_quintic_trinomial` (at ext_degree 5) and the verifier matches on
+    // `proof.alu_variant`; an off-canonical value could induce a different ALU AIR / VK.
+    if proof.alu_variant != spec.alu_variant
+        || proof.alu_quintic_trinomial != spec.alu_quintic_trinomial
+    {
+        return Err(proof_shape_err(&alloc::format!(
+            "prev ALU selectors (alu_variant={:?}, alu_quintic_trinomial={}) do not match the \
+             canonical ones (alu_variant={:?}, alu_quintic_trinomial={}); the verifier selects \
+             the ALU AIR from these, so an off-canonical selector yields a different VK",
+            proof.alu_variant,
+            proof.alu_quintic_trinomial,
+            spec.alu_variant,
+            spec.alu_quintic_trinomial,
+        )));
+    }
+
+    // Axis 3: the non-primitive manifest must be the EXACT canonical ORDERED list. The verifier
+    // walks `proof.non_primitives` IN ORDER (pushing one Dynamic AIR + one air_public_counts
+    // slot per entry), so the comparison is order-sensitive, NOT a multiset — a same-tables-
+    // different-ORDER proof builds a different verifier op-list / VK. Per entry we pin every
+    // op-list-driving field: op_type, lanes, rows (e.g. expose_claim AIR width = num_claims),
+    // public_values.len() (the air_public_counts slot width), and air_variant.
     if proof.non_primitives.len() != spec.canonical_npos.len() {
         return Err(proof_shape_err(&alloc::format!(
             "prev carries {} non-primitive table(s) but the canonical manifest pins {}; \
@@ -942,26 +1055,37 @@ where
             spec.canonical_npos.len()
         )));
     }
-    let mut remaining: Vec<(NpoTypeId, usize)> = spec.canonical_npos.clone();
-    for entry in &proof.non_primitives {
-        match remaining
-            .iter()
-            .position(|(t, l)| *t == entry.op_type && *l == entry.lanes)
+    for (i, (entry, canon)) in proof
+        .non_primitives
+        .iter()
+        .zip(spec.canonical_npos.iter())
+        .enumerate()
+    {
+        if entry.op_type != canon.op_type
+            || entry.lanes != canon.lanes
+            || entry.rows != canon.rows
+            || entry.public_values.len() != canon.public_values_len
+            || entry.air_variant != canon.air_variant
         {
-            Some(pos) => {
-                remaining.swap_remove(pos);
-            }
-            None => {
-                return Err(proof_shape_err(&alloc::format!(
-                    "prev carries non-primitive table `{}` at {} lane(s), which is not in \
-                     the canonical manifest at that lane count (extra table / wrong lanes); \
-                     a mismatched manifest yields a different verifier VK",
-                    entry.op_type, entry.lanes
-                )));
-            }
+            return Err(proof_shape_err(&alloc::format!(
+                "prev non-primitive entry #{i} (op_type={}, lanes={}, rows={}, \
+                 public_values.len()={}, air_variant={:?}) does not match the canonical entry at \
+                 that position (op_type={}, lanes={}, rows={}, public_values_len={}, \
+                 air_variant={:?}); the verifier walks this manifest in ORDER and its op-list \
+                 depends on all of these, so any divergence yields a different VK",
+                entry.op_type,
+                entry.lanes,
+                entry.rows,
+                entry.public_values.len(),
+                entry.air_variant,
+                canon.op_type,
+                canon.lanes,
+                canon.rows,
+                canon.public_values_len,
+                canon.air_variant,
+            )));
         }
     }
-    debug_assert!(remaining.is_empty(), "bijection: remaining must be empty");
     Ok(())
 }
 
@@ -981,13 +1105,17 @@ where
 /// fold-time one: a finished proof's table set is immutable, so this layer (which receives
 /// `prev` as an already-proved [`BatchStarkProof`]) CANNOT add a missing table to it.
 ///
-/// This layer is therefore FAIL-CLOSED: it runs the exact-shape precondition
+/// This layer is therefore FAIL-CLOSED: it runs the EXACT-shape precondition
 /// [`check_canonical_shape`] against `prev`, which REJECTS any proof that is missing a
-/// canonical table, carries an extra non-primitive table, has a wrong lane count, or has
-/// off-canonical packing — anything that would not land on the canonical VK. A proof that
-/// would silently mismatch the fixed VK is rejected here with a loud `Err`, never folded.
-/// See [`check_canonical_shape`] for the precisely-stated residual (per-entry
-/// `public_values.len()` / `air_variant` are not yet spec-encoded).
+/// canonical table, carries an extra non-primitive table, lists the canonical tables in a
+/// different ORDER, has a wrong lane/row/public-arity on any entry, an off-canonical ALU
+/// selector, or off-canonical packing — anything that would not land on the canonical VK. A
+/// proof that would silently mismatch the fixed VK is rejected here with a loud `Err`, never
+/// folded. Because manifest padding is child-build-time only (this layer cannot add an absent
+/// table to an immutable proof), the contract REQUIRES `prev` to have been built with
+/// [`inject_canonical_fillers`]; a child missing a canonical table fails the precondition.
+/// [`check_canonical_shape`] pins the COMPLETE set of op-list inputs, so it is exact (no
+/// per-entry-arity residual remains).
 pub fn build_and_prove_normalization_layer<SC, A, B, const D: usize>(
     prev: &RecursionInput<'_, SC, A>,
     config: &SC,
@@ -1233,7 +1361,7 @@ where
             .map_err(|e| proof_shape_err(&e.to_string()))?;
         return Ok(RecursionOutput(
             proof,
-            Rc::clone(&cached.circuit_prover_data),
+            Some(Rc::clone(&cached.circuit_prover_data)),
         ));
     }
 
@@ -1290,9 +1418,12 @@ where
             circuit_prover_data: Rc::clone(&circuit_prover_data_rc),
             prover,
         });
-        Ok(RecursionOutput(proof, circuit_prover_data_rc))
+        Ok(RecursionOutput(proof, Some(circuit_prover_data_rc)))
     } else {
-        Ok(RecursionOutput(proof, Rc::new(circuit_prover_data)))
+        Ok(RecursionOutput(
+            proof,
+            Some(Rc::new(circuit_prover_data)),
+        ))
     }
 }
 

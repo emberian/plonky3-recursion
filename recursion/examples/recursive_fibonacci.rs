@@ -379,7 +379,8 @@ macro_rules! define_field_module {
                             return;
                         }
 
-                        let mut output = RecursionOutput(proof_0, Rc::new(circuit_prover_data_0));
+                        let mut output =
+                            RecursionOutput(proof_0, Some(Rc::new(circuit_prover_data_0)));
 
                         // The verifier circuit grows until the proof size stabilises (fixed point).
                         // Track consecutive identical proof witness counts to detect this.
@@ -625,7 +626,8 @@ macro_rules! define_field_module_quintic {
                     return;
                 }
 
-                let mut output = RecursionOutput(proof_0, Rc::new(circuit_prover_data_0));
+                let mut output =
+                    RecursionOutput(proof_0, Some(Rc::new(circuit_prover_data_0)));
 
                 let mut prev_witness_count: Option<u32> = None;
                 let mut stable_prep: Option<NextLayerPrepCache<ConfigWithFriParams>> = None;
