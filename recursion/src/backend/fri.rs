@@ -329,6 +329,23 @@ where
             Self::BatchStark(b, _) => b.air_public_targets.clone(),
         }
     }
+
+    /// The child's preprocessed-commitment cap targets, in the SAME canonical
+    /// `to_observation_targets()` order `pin_preprocessed_commit` zips its expected values
+    /// against — so target `i` here is cap element `i` there. Empty when the child carries no
+    /// preprocessed columns (e.g. an IR-v2 native-batch leaf, whose AIRs have none).
+    ///
+    /// Reads ALREADY-ALLOCATED targets out of the verifier-inputs builder; pushes no ops.
+    fn child_vk_cap_targets(&self) -> Vec<crate::Target> {
+        match self {
+            Self::UniStark(b, _) => b
+                .preprocessed_commit
+                .as_ref()
+                .map(|c| c.to_observation_targets())
+                .unwrap_or_default(),
+            Self::BatchStark(b, _) => b.common_data.preprocessed_commit_observation_targets(),
+        }
+    }
 }
 
 fn build_verifier_circuit_impl<SC, A, const WIDTH: usize, const RATE: usize, C>(

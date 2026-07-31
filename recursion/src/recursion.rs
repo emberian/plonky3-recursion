@@ -257,6 +257,21 @@ where
     /// the in-circuit verifier, so re-exposing them carries a claim up a layer.
     /// A `UniStark` child returns a single instance.
     fn air_public_targets(&self) -> Vec<Vec<crate::Target>>;
+
+    /// The allocated preprocessed-commitment cap targets for this verified child — its
+    /// VK-identity core, in canonical `to_observation_targets()` order. Empty when the child
+    /// carries no preprocessed columns.
+    ///
+    /// These are the SAME targets [`crate::pin_preprocessed_commit`] constrains, and the same ones
+    /// the child's preprocessed-trace opening is checked against (they are pushed as a commitment
+    /// round of the in-circuit PCS verify). Surfacing them lets a caller's expose hook route the
+    /// cap through an `expose_claim` table, making the child's circuit identity a host-readable,
+    /// FRI-bound public value a caller-held anchor can refuse — which the `alloc_const` pin alone
+    /// cannot do, because a constant's VALUE lives in `ConstAir`'s constraint-free main trace and
+    /// never reaches the parent's preprocessed commitment.
+    ///
+    /// Returns ALREADY-ALLOCATED targets: no ops are pushed and no constraints are added.
+    fn child_vk_cap_targets(&self) -> Vec<crate::Target>;
 }
 
 /// PCS-specific backend for building verifier circuits and setting private data.
@@ -412,8 +427,11 @@ where
 
 /// Hook invoked after a single child's verifier constraints are built (and
 /// before the circuit is finalized), receiving that child's per-instance
-/// `air_public_targets`. Used to re-expose chain claims at a leaf wrap.
-pub type NextLayerExposeHook<'a, F> = &'a dyn Fn(&mut CircuitBuilder<F>, &[Vec<crate::Target>]);
+/// `air_public_targets` AND its preprocessed-commitment cap targets
+/// ([`VerifierCircuitResult::child_vk_cap_targets`], empty when the child has no preprocessed
+/// columns). Used to re-expose chain claims — and the child's VK identity — at a leaf wrap.
+pub type NextLayerExposeHook<'a, F> =
+    &'a dyn Fn(&mut CircuitBuilder<F>, &[Vec<crate::Target>], &[crate::Target]);
 
 /// Like [`build_next_layer_circuit`], but invokes `expose` (if any) on the
 /// builder after the child verifier constraints are emitted, so the caller can
@@ -444,7 +462,8 @@ where
 
     if let Some(expose) = expose {
         let apt = verifier_result.air_public_targets();
-        expose(&mut circuit_builder, &apt);
+        let vk_cap = verifier_result.child_vk_cap_targets();
+        expose(&mut circuit_builder, &apt, &vk_cap);
     }
 
     let verification_circuit = circuit_builder
@@ -1192,10 +1211,19 @@ where
 
 /// Hook invoked after both children's verifier constraints are built (and before
 /// the aggregation circuit is finalized), receiving the LEFT and RIGHT children's
-/// per-instance `air_public_targets`. Used to re-expose + connect-bind chain
-/// claims one layer up the fold.
-pub type AggExposeHook<'a, F> =
-    &'a dyn Fn(&mut CircuitBuilder<F>, &[Vec<crate::Target>], &[Vec<crate::Target>]);
+/// per-instance `air_public_targets` and then their preprocessed-commitment cap targets
+/// ([`VerifierCircuitResult::child_vk_cap_targets`]; empty for a child with no preprocessed
+/// columns). Used to re-expose + connect-bind chain claims one layer up the fold, and to carry
+/// each child's VK identity into the parent's exposed claim.
+///
+/// Argument order: `(builder, left_apt, right_apt, left_vk_cap, right_vk_cap)`.
+pub type AggExposeHook<'a, F> = &'a dyn Fn(
+    &mut CircuitBuilder<F>,
+    &[Vec<crate::Target>],
+    &[Vec<crate::Target>],
+    &[crate::Target],
+    &[crate::Target],
+);
 
 /// Like [`build_aggregation_layer_circuit`], but invokes `expose` (if any) on the
 /// builder after both child verifiers are emitted, receiving the left and right
@@ -1243,7 +1271,17 @@ where
     if let Some(expose) = expose {
         let left_apt = left_result.air_public_targets();
         let right_apt = right_result.air_public_targets();
-        expose(&mut circuit_builder, &left_apt, &right_apt);
+        let left_vk_cap =
+            <_ as VerifierCircuitResult<SC, A1>>::child_vk_cap_targets(&left_result);
+        let right_vk_cap =
+            <_ as VerifierCircuitResult<SC, A2>>::child_vk_cap_targets(&right_result);
+        expose(
+            &mut circuit_builder,
+            &left_apt,
+            &right_apt,
+            &left_vk_cap,
+            &right_vk_cap,
+        );
     }
 
     let verification_circuit = circuit_builder
