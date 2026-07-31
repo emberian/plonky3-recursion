@@ -28,6 +28,16 @@
 //!
 //! This test asserts the conflict still REPRODUCES (a live repro/regression). Once the
 //! global-LogUp balance is fixed, flip the assertion to require a clean replay.
+//!
+//! ⚑ **STALE AS OF `fc3c6df` — the fixtures predate a preprocessed-layout change and must be
+//! re-frozen.** `ConstAir`'s preprocessed row went from `[ext_mult, out_idx]` (width 2) to
+//! `[ext_mult, out_idx, value[0..D]]`, because a constant's value belongs to the circuit's
+//! identity and previously reached no commitment at all. `agg_child_<N>.bin` was captured
+//! under the OLD width, so the in-circuit verifier reads a preprocessed column the frozen
+//! proof does not carry and this test panics `index out of bounds: the len is 2 but the
+//! index is 2` inside `const_air.rs`. That panic is the stale artifact refusing to load, not
+//! a regression in the replay. Re-capture the two children from dregg's
+//! `k_fold_turn_chain_proves_and_verifies` fold at this rev or later.
 
 mod common;
 
