@@ -1041,7 +1041,8 @@ where
             packing.alu_lanes()
         };
 
-        // Const — preprocessed is already in [ext_mult, index] 2-col format.
+        // Const — preprocessed is already in [ext_mult, index, value[0..D]] (D + 2)-col format;
+        // `ConstAir::eval` constrains the main-trace value against the preprocessed one.
         let const_rows = traces.const_trace.values.len();
         let const_prep = primitive[PrimitiveOpType::Const as usize].clone();
         let const_air = ConstAir::<Val<SC>, D>::new_with_preprocessed(const_rows, const_prep)

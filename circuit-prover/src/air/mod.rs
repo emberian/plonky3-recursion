@@ -1,6 +1,6 @@
 pub mod alu_air;
 mod alu_columns;
-mod column_layout;
+pub(crate) mod column_layout;
 pub mod const_air;
 pub mod expose_claim_air;
 mod expose_claim_columns;

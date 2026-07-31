@@ -38,6 +38,27 @@ const fn witness_lookup_prep_col_map() -> WitnessLookupPrepCols<usize> {
 /// Offsets `(0..WITNESS_LOOKUP_PREP_LANE_WIDTH)` as named fields.
 pub const WITNESS_LOOKUP_PREP_COL_MAP: WitnessLookupPrepCols<usize> = witness_lookup_prep_col_map();
 
+/// Column offset of the first value coefficient in a [`super::const_air::ConstAir`]
+/// preprocessed row: the shared `[multiplicity, witness_idx]` lane comes first.
+pub const CONST_PREP_VALUE_OFFSET: usize = WITNESS_LOOKUP_PREP_LANE_WIDTH;
+
+/// Preprocessed row width for [`super::const_air::ConstAir`] at extension degree `d`:
+/// `[multiplicity, witness_idx, value[0..d]]`.
+///
+/// A constant's VALUE is preprocessed data, not witness data — it is fixed by the circuit,
+/// not chosen by the prover. Keeping it only in the main trace (as this table did before)
+/// left two circuits differing solely in a constant with byte-identical preprocessed
+/// commitments, so nothing downstream that pins the preprocessed commitment — a verifying
+/// key, a recursive parent's cap pin — could tell them apart. [`super::const_air::ConstAir`]
+/// constrains `main.value == prep.value`, so the committed main-trace value cannot disagree
+/// with the value the verifying key names.
+///
+/// [`super::public_air::PublicAir`] deliberately does NOT do this: a public input's value is
+/// per-execution data and must stay out of the circuit's identity.
+pub const fn const_prep_lane_width(d: usize) -> usize {
+    WITNESS_LOOKUP_PREP_LANE_WIDTH + d
+}
+
 const _: () = assert!(
     size_of::<WitnessLookupPrepCols<usize>>()
         == WITNESS_LOOKUP_PREP_LANE_WIDTH * size_of::<usize>()

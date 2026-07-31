@@ -14,9 +14,25 @@
 //!     [value[0], value[1], ..., value[D-1], index]
 //! ```
 //!
+//! # Preprocessed layout
+//!
+//! `[ext_mult, index, value[0], ..., value[D-1]]` — width `D + 2`.
+//!
+//! The value appears in BOTH traces on purpose. It is preprocessed data (fixed by the
+//! circuit, not chosen by the prover), so it belongs in the preprocessed commitment; it is
+//! also needed in the main trace because the witness-bus interaction reads main columns.
+//!
 //! # Constraints
 //!
-//! The AIR has no constraints.
+//! `main.value[i] == prep.value[i]` for `i` in `0..D` — the constant's committed main-trace
+//! value must equal the value its preprocessed (verifying-key) row names.
+//!
+//! Before this existed the table had no constraints at all and the value lived only in the
+//! main trace, so two circuits differing solely in a constant produced byte-identical
+//! preprocessed commitments. Anything that pins a preprocessed commitment as circuit
+//! identity — a verifying-key fingerprint, a recursive parent's cap pin — could not
+//! separate them, and a constant is a constraint operand: zeroing a coefficient weakens
+//! what the surrounding circuit says while leaving its identity untouched.
 //!
 //! # Global Interactions
 //!
@@ -36,7 +52,9 @@ use p3_matrix::Matrix;
 use p3_matrix::dense::RowMajorMatrix;
 use tracing::instrument;
 
-use crate::air::column_layout::{WITNESS_LOOKUP_PREP_COL_MAP, WITNESS_LOOKUP_PREP_LANE_WIDTH};
+use crate::air::column_layout::{
+    CONST_PREP_VALUE_OFFSET, WITNESS_LOOKUP_PREP_COL_MAP, const_prep_lane_width,
+};
 
 /// ConstAir: vector-valued constant binding with generic extension degree D.
 ///
@@ -90,9 +108,9 @@ impl<F: Field, const D: usize> ConstAir<F, D> {
         self
     }
 
-    /// Number of preprocessed columns: multiplicity + index.
+    /// Number of preprocessed columns: multiplicity + index + the `D` value coefficients.
     pub const fn preprocessed_width() -> usize {
-        WITNESS_LOOKUP_PREP_LANE_WIDTH
+        const_prep_lane_width(D)
     }
     /// Convert a `ConstTrace` into a `RowMajorMatrix` suitable for the STARK prover.
     ///
@@ -146,7 +164,7 @@ impl<F: Field, const D: usize> BaseAir<F> for ConstAir<F, D> {
     }
 
     fn preprocessed_width(&self) -> usize {
-        WITNESS_LOOKUP_PREP_LANE_WIDTH
+        const_prep_lane_width(D)
     }
 
     fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
@@ -170,8 +188,6 @@ where
     AB::F: Field,
 {
     fn eval(&self, builder: &mut AB) {
-        // No constraints for constants. Just emit the WitnessChecks send: the (witness_idx,
-        // value) tuple is published with the row's preprocessed multiplicity.
         let main = builder.main();
         let main_local = main.current_slice();
         let prep = builder.preprocessed().clone();
@@ -179,6 +195,13 @@ where
 
         let multiplicity: AB::Expr = prep_local[WITNESS_LOOKUP_PREP_COL_MAP.multiplicity].into();
         let witness_idx: AB::Expr = prep_local[WITNESS_LOOKUP_PREP_COL_MAP.witness_idx].into();
+
+        // The constant's value is preprocessed data. Bind the main-trace copy the witness bus
+        // reads to the preprocessed copy the verifying-key commitment covers, so a prover
+        // cannot present a value the circuit's identity does not name. Degree 1.
+        for i in 0..D {
+            builder.assert_eq(main_local[i], prep_local[CONST_PREP_VALUE_OFFSET + i]);
+        }
 
         let mut fields: Vec<AB::Expr> = Vec::with_capacity(1 + D);
         fields.push(witness_idx);
@@ -214,10 +237,11 @@ mod tests {
         // Witness IDs these constants bind to
         let const_indices = vec![WitnessId(1), WitnessId(3), WitnessId(4)];
 
-        // Preprocessed values are [ext_mult, index] pairs.
+        // Preprocessed rows are [ext_mult, index, value] (D = 1).
         let preprocessed_values = const_indices
             .iter()
-            .flat_map(|idx| [F::ONE, F::from_u64(idx.0 as u64)])
+            .zip(const_values.iter())
+            .flat_map(|(idx, &v)| [F::ONE, F::from_u64(idx.0 as u64), v])
             .collect::<Vec<_>>();
 
         let trace = ConstTrace {
@@ -253,16 +277,22 @@ mod tests {
         assert_eq!(preprocessed_matrix.height(), height);
 
         // Assert the preprocessed values were properly created.
-        // Layout: [ext_mult, index] (width=2)
+        // Layout: [ext_mult, index, value] (width = 3 at D = 1)
+        assert_eq!(preprocessed_matrix.width(), 3);
         const_indices.iter().enumerate().for_each(|(i, const_idx)| {
             let row = preprocessed_matrix.row_slice(i).unwrap();
             assert_eq!(row[0], F::ONE);
             assert_eq!(row[1], F::from_u32(const_idx.0));
+            // The VALUE is preprocessed too, and equals the main-trace copy (`data[i]` above).
+            assert_eq!(row[2], data[i]);
         });
-        // Check the padding row
+        // Check the padding row. The value column pads to ZERO on both sides, so the
+        // `main.value == prep.value` constraint holds on padding rows as well.
         let last_row = preprocessed_matrix.row_slice(height - 1).unwrap();
         assert_eq!(last_row[0], F::ZERO);
         assert_eq!(last_row[1], F::ZERO);
+        assert_eq!(last_row[2], F::ZERO);
+        assert_eq!(data[height - 1], F::ZERO);
     }
 
     #[test]
@@ -286,10 +316,15 @@ mod tests {
 
         let const_values = vec![const1, const2];
         let const_indices = vec![WitnessId(10), WitnessId(20)];
-        // Preprocessed values are [ext_mult, index] pairs; indices are D-scaled.
+        // Preprocessed rows are [ext_mult, index, value[0..4]]; indices are D-scaled.
         let preprocessed_values = const_indices
             .iter()
-            .flat_map(|idx| [F::ONE, F::from_u64(idx.0 as u64 * 4)])
+            .zip(const_values.iter())
+            .flat_map(|(idx, v)| {
+                let mut row = vec![F::ONE, F::from_u64(idx.0 as u64 * 4)];
+                row.extend_from_slice(v.as_basis_coefficients_slice());
+                row
+            })
             .collect::<Vec<_>>();
 
         let trace = ConstTrace {
@@ -321,21 +356,40 @@ mod tests {
 
         let air = ConstAir::<F, 4>::new_with_preprocessed(height, preprocessed_values);
         let preprocessed_matrix = air.preprocessed_trace().unwrap();
-        // Layout: [ext_mult, index] (width=2, D-scaled indices)
+        // Layout: [ext_mult, index, value[0..4]] (width = 6, D-scaled indices)
+        assert_eq!(preprocessed_matrix.width(), 6);
         let row0 = preprocessed_matrix.row_slice(0).unwrap();
         assert_eq!(row0[0], F::ONE); // ext_mult
         // D-scaled index: WitnessId(10) → 10 * 4 = 40
         assert_eq!(row0[1], F::from_u64(40));
+        // The value coefficients match the main trace row-for-row.
+        assert_eq!(&row0[2..6], &data[0..4]);
         let last_row = preprocessed_matrix.row_slice(height - 1).unwrap();
         assert_eq!(last_row[0], F::ONE); // ext_mult
         // D-scaled index: WitnessId(20) → 20 * 4 = 80
         assert_eq!(last_row[1], F::from_u64(80));
+        assert_eq!(&last_row[2..6], &data[4..8]);
+    }
+
+    /// A constant's VALUE reaches the preprocessed trace, so two `ConstAir`s differing ONLY
+    /// in a constant present DIFFERENT preprocessed traces — the property everything that
+    /// treats a preprocessed commitment as circuit identity depends on. Before the value
+    /// moved into preprocessed these two matrices were byte-identical.
+    #[test]
+    fn two_constants_give_two_preprocessed_traces() {
+        let prep = |v: u64| {
+            ConstAir::<F, 1>::new_with_preprocessed(1, vec![F::ONE, F::ONE, F::from_u64(v)])
+                .preprocessed_trace()
+                .unwrap()
+                .values
+        };
+        assert_ne!(prep(7), prep(9));
     }
 
     #[test]
     fn test_air_constraint_degree() {
-        // 8 ops * 2 columns per op ([ext_mult, index])
-        let air = ConstAir::<F, 1>::new_with_preprocessed(8, vec![F::ZERO; 16]);
+        // 8 ops * 3 columns per op ([ext_mult, index, value]) at D = 1.
+        let air = ConstAir::<F, 1>::new_with_preprocessed(8, vec![F::ZERO; 24]);
         p3_test_utils::assert_air_constraint_degree!(air, "ConstAir");
     }
 }

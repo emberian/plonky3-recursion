@@ -3,12 +3,13 @@ use alloc::vec::Vec;
 use core::any::Any;
 
 use hashbrown::HashMap;
-use p3_circuit::ops::{NonPrimitivePreprocessedMap, NpoTypeId, PrimitiveOpType};
+use p3_circuit::ops::{NonPrimitivePreprocessedMap, NpoTypeId, Op, PrimitiveOpType};
 use p3_circuit::{Circuit, CircuitError};
 use p3_field::{Algebra, ExtensionField, Field, PrimeCharacteristicRing, PrimeField64};
 use p3_uni_stark::{StarkGenericConfig, SymbolicExpression, SymbolicExpressionExt, Val};
 use p3_util::log2_ceil_usize;
 
+use crate::air::column_layout::const_prep_lane_width;
 use crate::air::{AluAir, ConstAir, PublicAir};
 use crate::config::StarkField;
 use crate::field_params::ExtractBinomialW;
@@ -382,18 +383,42 @@ where
             }
             PrimitiveOpType::Const => {
                 // Const preprocessed per op from circuit.rs: 1 value (D-scaled out_idx).
-                // Convert to [ext_mult, out_idx] pairs using ext_reads.
-                let mut prep_2col: Vec<Val<SC>> = Vec::with_capacity(base_prep[idx].len() * 2);
-                for &out_idx in &base_prep[idx] {
+                // Convert to [ext_mult, out_idx, value[0..D]] rows using ext_reads.
+                //
+                // The VALUE is preprocessed data: it is fixed by the circuit, not chosen by
+                // the prover, and it is what makes two otherwise-identical circuits DIFFERENT
+                // circuits. It is read straight off `circuit.ops`, whose `Op::Const` order is
+                // the order `generate_preprocessed_columns` pushed `primitive[Const]` in — one
+                // shared single pass over `self.ops` — so row k here is op k there.
+                let const_vals: Vec<&ExtF> = circuit
+                    .ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        Op::Const { val, .. } => Some(val),
+                        _ => None,
+                    })
+                    .collect();
+                debug_assert_eq!(
+                    const_vals.len(),
+                    base_prep[idx].len(),
+                    "one Const preprocessed index per Op::Const"
+                );
+                let lane = const_prep_lane_width(D);
+                let mut prep_cols: Vec<Val<SC>> =
+                    Vec::with_capacity(base_prep[idx].len() * lane);
+                for (k, &out_idx) in base_prep[idx].iter().enumerate() {
                     let out_wid = out_idx.as_canonical_u64() as usize / D;
                     let n_reads = preprocessed.ext_reads.get(out_wid).copied().unwrap_or(0);
-                    prep_2col.push(<Val<SC>>::from_u32(n_reads));
-                    prep_2col.push(out_idx);
+                    prep_cols.push(<Val<SC>>::from_u32(n_reads));
+                    prep_cols.push(out_idx);
+                    let coeffs = const_vals[k].as_basis_coefficients_slice();
+                    debug_assert_eq!(coeffs.len(), D, "extension degree mismatch for Op::Const");
+                    prep_cols.extend_from_slice(coeffs);
                 }
 
-                let height = prep_2col.len() / 2;
-                // Store the converted 2-col format before building the AIR.
-                base_prep[idx] = prep_2col;
+                let height = prep_cols.len() / lane;
+                // Store the converted (D + 2)-col format before building the AIR.
+                base_prep[idx] = prep_cols;
                 let const_air = ConstAir::new_with_preprocessed(height, base_prep[idx].clone())
                     .with_min_height(min_height);
                 table_preps.push((CircuitTableAir::Const(const_air), compute_degree(height)));
