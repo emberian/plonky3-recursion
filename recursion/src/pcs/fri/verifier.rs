@@ -1350,6 +1350,10 @@ where
 /// Returns the list of non-primitive operation IDs that require private data
 /// (Merkle sibling values) to be set by the runner.
 ///
+/// `expected_num_queries` is the **configured** query count. It is a soundness
+/// parameter — query soundness is linear in it — so it comes from the verifier's
+/// params, never from the proof. See the check below.
+///
 /// Reference (Plonky3): `p3_fri::verifier::verify_fri`
 pub fn verify_fri_circuit<F, EF, RecMmcs, Inner, Witness, Comm>(
     builder: &mut CircuitBuilder<EF>,
@@ -1359,6 +1363,7 @@ pub fn verify_fri_circuit<F, EF, RecMmcs, Inner, Witness, Comm>(
     index_bits_per_query: &[Vec<Target>],
     commitments_with_opening_points: &ComsWithOpeningsTargets<Comm, TwoAdicMultiplicativeCoset<F>>,
     log_blowup: usize,
+    expected_num_queries: usize,
     permutation_config: Option<PermConfig>,
 ) -> Result<Vec<NonPrimitiveOpId>, VerificationError>
 where
@@ -1387,6 +1392,23 @@ where
         log_blowup,
         log_arities,
     );
+
+    // Pin the query count against the configured one BEFORE any other shape check.
+    //
+    // Query soundness is linear in the query count, so `num_queries` is a soundness
+    // parameter and not a shape hint. Every other soundness knob reaching this
+    // function (`log_blowup`, `log_final_poly_len`, the PoW bit counts) is compiled
+    // in from `FriVerifierParams`; this one used to be read off
+    // `fri_proof_targets.query_proofs.len()` and compared against nothing, so the
+    // proof being verified chose its own security level. Mirrors the native
+    // `p3_fri::verifier::verify_fri` check that raises
+    // `FriError::QueryProofCountMismatch`.
+    if num_queries != expected_num_queries {
+        return Err(VerificationError::InvalidProofShape(format!(
+            "FRI query proof count must equal the configured number of queries: \
+             expected {expected_num_queries}, got {num_queries}"
+        )));
+    }
 
     // Validate shape.
     if num_phases != fri_proof_targets.commit_phase_commits.len() {

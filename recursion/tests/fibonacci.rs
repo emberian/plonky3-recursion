@@ -57,6 +57,7 @@ fn build_fibonacci_test_setup() -> FibonacciTestSetup {
     let fri_verifier_params = FriVerifierParams::with_mmcs(
         scalars.log_blowup,
         scalars.log_final_poly_len,
+        scalars.num_queries,
         scalars.commit_pow_bits,
         scalars.query_pow_bits,
         Poseidon2Config::BABY_BEAR_D4_W16,

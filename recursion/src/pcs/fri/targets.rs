@@ -771,12 +771,24 @@ where
         let FriVerifierParams {
             log_blowup,
             log_final_poly_len,
+            num_queries: expected_num_queries,
             commit_pow_bits: _,
             query_pow_bits: _,
             permutation_config,
         } = *params;
         let num_betas = opening_proof.commit_phase_commits.len();
         let num_queries = opening_proof.query_proofs.len();
+
+        // Refuse a proof that brings its own query count before sampling anything
+        // from the challenger for it. `verify_fri_circuit` pins this again at the
+        // chokepoint (it is public API); this copy keeps the attacker-chosen count
+        // from driving the sampling loop at all.
+        if num_queries != expected_num_queries {
+            return Err(VerificationError::InvalidProofShape(format!(
+                "FRI query proof count must equal the configured number of queries: \
+                 expected {expected_num_queries}, got {num_queries}"
+            )));
+        }
 
         let alpha = challenges[0];
         let betas = &challenges[1..1 + num_betas];
@@ -803,6 +815,7 @@ where
             &index_bits_per_query,
             commitments_with_opening_points,
             log_blowup,
+            expected_num_queries,
             permutation_config,
         )
     }
@@ -1160,6 +1173,7 @@ where
         let FriVerifierParams {
             log_blowup,
             log_final_poly_len,
+            num_queries: expected_num_queries,
             commit_pow_bits: _,
             query_pow_bits: _,
             permutation_config,
@@ -1167,6 +1181,15 @@ where
         let fri_proof = &opening_proof.inner_proof;
         let num_betas = fri_proof.commit_phase_commits.len();
         let num_queries = fri_proof.query_proofs.len();
+
+        // See the non-hiding `verify_circuit`: the query count is configured, never
+        // taken from the proof.
+        if num_queries != expected_num_queries {
+            return Err(VerificationError::InvalidProofShape(format!(
+                "FRI query proof count must equal the configured number of queries: \
+                 expected {expected_num_queries}, got {num_queries}"
+            )));
+        }
 
         let alpha = challenges[0];
         let betas = &challenges[1..1 + num_betas];
@@ -1198,6 +1221,7 @@ where
             &index_bits_per_query,
             &merged_commitments,
             log_blowup,
+            expected_num_queries,
             permutation_config,
         )
     }

@@ -29,7 +29,17 @@ type InnerFri = InnerFriGeneric<MyConfig, MyHash, MyCompress, DIGEST_ELEMS>;
 const TRACE_D: usize = 1;
 
 fn fri_verifier_params(log_blowup: usize) -> FriVerifierParams {
-    FriVerifierParams::with_mmcs(log_blowup, 0, 0, 16, Poseidon2Config::KOALA_BEAR_D4_W16)
+    // `num_queries` must be the SAME expression `make_test_config_with_fri` uses
+    // (`(100 - query_pow_bits) / log_blowup`) — the verifier pins the proof's
+    // query count against it, so a drift here is a refusal, not a silent weakening.
+    FriVerifierParams::with_mmcs(
+        log_blowup,
+        0,
+        (100 - 16) / log_blowup,
+        0,
+        16,
+        Poseidon2Config::KOALA_BEAR_D4_W16,
+    )
 }
 
 #[test]

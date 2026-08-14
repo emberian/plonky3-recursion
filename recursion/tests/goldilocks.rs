@@ -46,6 +46,7 @@ fn make_config() -> (MyConfig, Perm, FriVerifierParams) {
     let fri_verifier_params = FriVerifierParams::with_mmcs(
         fri_params.log_blowup,
         fri_params.log_final_poly_len,
+        fri_params.num_queries,
         fri_params.commit_proof_of_work_bits,
         fri_params.query_proof_of_work_bits,
         Poseidon2Config::GOLDILOCKS_D2_W8,
@@ -163,6 +164,7 @@ fn test_goldilocks_mul_verifier_with_preprocessed() -> Result<(), VerificationEr
         let fri_verifier_params = FriVerifierParams::unsafe_arithmetic_only_for_tests(
             fri_params2.log_blowup,
             fri_params2.log_final_poly_len,
+            fri_params2.num_queries,
             fri_params2.commit_proof_of_work_bits,
             fri_params2.query_proof_of_work_bits,
         );

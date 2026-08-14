@@ -450,10 +450,14 @@ macro_rules! define_field_module_types {
             MyConfig::new(pcs, challenger)
         }
 
-        fn create_fri_verifier_params(fp: &FriParams) -> FriVerifierParams {
+        /// `security_level` is required because `num_queries` is a soundness
+        /// parameter the verifier must pin; it is derived by exactly the same
+        /// expression `create_config` uses so the two cannot drift.
+        fn create_fri_verifier_params(fp: &FriParams, security_level: usize) -> FriVerifierParams {
             FriVerifierParams::with_mmcs(
                 fp.log_blowup,
                 fp.log_final_poly_len,
+                (security_level - fp.query_pow_bits) / fp.log_blowup,
                 fp.commit_pow_bits,
                 fp.query_pow_bits,
                 $poseidon2_config,
@@ -467,7 +471,7 @@ macro_rules! define_field_module_types {
         ) -> ConfigWithFriParams {
             ConfigWithFriParams {
                 config: Arc::new(create_config(fp, security_level)),
-                fri_verifier_params: create_fri_verifier_params(fp),
+                fri_verifier_params: create_fri_verifier_params(fp, security_level),
                 disable_recompose_npo,
             }
         }
@@ -512,7 +516,7 @@ macro_rules! define_field_module_types {
         ) -> ConfigWithFriParamsZk {
             ConfigWithFriParamsZk {
                 config: Arc::new(create_config_zk(fp, security_level, rng_seed)),
-                fri_verifier_params: create_fri_verifier_params(fp),
+                fri_verifier_params: create_fri_verifier_params(fp, security_level),
                 disable_recompose_npo,
             }
         }
@@ -719,10 +723,14 @@ macro_rules! define_field_module_types_quintic {
             MyConfig::new(pcs, challenger)
         }
 
-        fn create_fri_verifier_params(fp: &FriParams) -> FriVerifierParams {
+        /// `security_level` is required because `num_queries` is a soundness
+        /// parameter the verifier must pin; it is derived by exactly the same
+        /// expression `create_config` uses so the two cannot drift.
+        fn create_fri_verifier_params(fp: &FriParams, security_level: usize) -> FriVerifierParams {
             FriVerifierParams::with_mmcs(
                 fp.log_blowup,
                 fp.log_final_poly_len,
+                (security_level - fp.query_pow_bits) / fp.log_blowup,
                 fp.commit_pow_bits,
                 fp.query_pow_bits,
                 $poseidon2_config,
@@ -736,7 +744,7 @@ macro_rules! define_field_module_types_quintic {
         ) -> ConfigWithFriParams {
             ConfigWithFriParams {
                 config: Arc::new(create_config(fp, security_level)),
-                fri_verifier_params: create_fri_verifier_params(fp),
+                fri_verifier_params: create_fri_verifier_params(fp, security_level),
                 disable_recompose_npo,
             }
         }

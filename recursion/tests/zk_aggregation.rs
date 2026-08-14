@@ -149,6 +149,7 @@ fn add_zk_batch_verifier_to_circuit(
         FriVerifierParams::unsafe_arithmetic_only_for_tests(
             fri_params.log_blowup,
             fri_params.log_final_poly_len,
+            fri_params.num_queries,
             fri_params.commit_proof_of_work_bits,
             fri_params.query_proof_of_work_bits,
         )

@@ -26,6 +26,7 @@ fn test_mul_verifier_circuit() -> Result<(), VerificationError> {
     let fri_verifier_params = FriVerifierParams::unsafe_arithmetic_only_for_tests(
         scalars.log_blowup,
         scalars.log_final_poly_len,
+        scalars.num_queries,
         scalars.commit_pow_bits,
         scalars.query_pow_bits,
     );

@@ -43,6 +43,8 @@ mod common;
 
 use std::path::PathBuf;
 
+use p3_baby_bear::{BabyBear, default_babybear_poseidon2_16, default_babybear_poseidon2_24};
+use p3_challenger::DuplexChallenger;
 use p3_circuit::CircuitBuilder;
 use p3_circuit::ops::{
     PermConfig, Poseidon2Config, generate_poseidon2_trace, generate_recompose_trace,
@@ -51,23 +53,20 @@ use p3_circuit_prover::{
     BatchStarkProver, ConstraintProfile, ExposeClaimProver, Poseidon2Prover, RecomposeProver,
     TableProver,
 };
+use p3_commit::ExtensionMmcs;
 use p3_dft::Radix2DitParallel;
+use p3_field::Field;
 use p3_field::extension::BinomialExtensionField;
 use p3_fri::{FriParameters, TwoAdicFriPcs};
 use p3_lookup::logup::LogUpGadget;
+use p3_merkle_tree::MerkleTreeMmcs;
 use p3_poseidon2_circuit_air::{BabyBearD4Width16, BabyBearD4Width24};
 use p3_recursion::pcs::fri::{FriVerifierParams, InputProofTargets, MerkleCapTargets, RecValMmcs};
 use p3_recursion::pcs::set_fri_mmcs_private_data;
 use p3_recursion::verifier::verify_p3_batch_proof_circuit;
 use p3_recursion::{Poseidon2Config as RecPoseidon2Config, VerificationError};
-use p3_uni_stark::StarkConfig;
-
-use p3_baby_bear::{BabyBear, default_babybear_poseidon2_16, default_babybear_poseidon2_24};
-use p3_challenger::DuplexChallenger;
-use p3_commit::ExtensionMmcs;
-use p3_field::Field;
-use p3_merkle_tree::MerkleTreeMmcs;
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
+use p3_uni_stark::StarkConfig;
 
 use crate::common::InnerFriGeneric;
 
@@ -81,8 +80,14 @@ type Dft = Radix2DitParallel<F>;
 type Perm = p3_baby_bear::Poseidon2BabyBear<WIDTH>;
 type MyHash = PaddingFreeSponge<Perm, WIDTH, RATE, DIGEST_ELEMS>;
 type MyCompress = TruncatedPermutation<Perm, 2, DIGEST_ELEMS, WIDTH>;
-type MyMmcs =
-    MerkleTreeMmcs<<F as Field>::Packing, <F as Field>::Packing, MyHash, MyCompress, 2, DIGEST_ELEMS>;
+type MyMmcs = MerkleTreeMmcs<
+    <F as Field>::Packing,
+    <F as Field>::Packing,
+    MyHash,
+    MyCompress,
+    2,
+    DIGEST_ELEMS,
+>;
 type ChallengeMmcs = ExtensionMmcs<F, Challenge, MyMmcs>;
 type Challenger = DuplexChallenger<F, Perm, WIDTH, RATE>;
 type MyPcs = TwoAdicFriPcs<F, Dft, MyMmcs, ChallengeMmcs>;
@@ -90,9 +95,10 @@ type MyConfig = StarkConfig<MyPcs, Challenge, Challenger>;
 type InnerFri = InnerFriGeneric<MyConfig, MyHash, MyCompress, DIGEST_ELEMS>;
 
 /// The `ir2_leaf_wrap_config` knobs the dregg aggregation layers run under:
-/// log_blowup=6, log_final_poly_len=0, commit_pow=0, query_pow=16. num_queries
-/// (19) + folding arity are read from the proof in-circuit; for verification only
-/// log_blowup + pow + the perm/MMCS matter for Fiat-Shamir parity.
+/// log_blowup=6, log_final_poly_len=0, num_queries=19, commit_pow=0, query_pow=16.
+/// The folding arity schedule is still read from the proof in-circuit (its SUM is
+/// pinned transitively by the max-height check); `num_queries` is now pinned
+/// directly against the configured count.
 fn ir2_replay_config() -> MyConfig {
     let perm = default_babybear_poseidon2_16();
     let hash = MyHash::new(perm.clone());
@@ -116,6 +122,7 @@ fn ir2_replay_fri_params() -> FriVerifierParams {
     FriVerifierParams::with_mmcs(
         6,
         0,
+        19,
         0,
         16,
         PermConfig::poseidon2(Poseidon2Config::BABY_BEAR_D4_W16),
@@ -165,14 +172,12 @@ fn replay_one(path: &std::path::Path) -> Result<(), VerificationError> {
     // NATIVE must accept this frozen child: its WitnessChecks global cumulative balances
     // to zero (the W24 segment-digest / expose_claim bus fix). A REJECT here is the
     // regression this oracle guards.
-    np_prover
-        .verify_all_tables(&proof)
-        .unwrap_or_else(|e| {
-            panic!(
-                "[frozen-replay] {:?}: NATIVE verify_all_tables REJECTED (bus regression): {e:?}",
-                path.file_name().unwrap()
-            )
-        });
+    np_prover.verify_all_tables(&proof).unwrap_or_else(|e| {
+        panic!(
+            "[frozen-replay] {:?}: NATIVE verify_all_tables REJECTED (bus regression): {e:?}",
+            path.file_name().unwrap()
+        )
+    });
     eprintln!(
         "[frozen-replay] {:?}: NATIVE verify_all_tables ACCEPTS",
         path.file_name().unwrap()
@@ -234,7 +239,15 @@ fn replay_one(path: &std::path::Path) -> Result<(), VerificationError> {
         .set_private_inputs(&private_inputs)
         .map_err(VerificationError::Circuit)?;
 
-    set_fri_mmcs_private_data::<F, Challenge, ChallengeMmcs, MyMmcs, MyHash, MyCompress, DIGEST_ELEMS>(
+    set_fri_mmcs_private_data::<
+        F,
+        Challenge,
+        ChallengeMmcs,
+        MyMmcs,
+        MyHash,
+        MyCompress,
+        DIGEST_ELEMS,
+    >(
         &mut runner,
         &op_ids,
         &proof.proof.opening_proof,
@@ -284,7 +297,10 @@ fn frozen_agg_children_replay() {
     let mut conflicts: Vec<String> = Vec::new();
     for path in &children {
         match replay_one(path) {
-            Ok(()) => eprintln!("[frozen-replay] {:?}: OK (clean replay)", path.file_name().unwrap()),
+            Ok(()) => eprintln!(
+                "[frozen-replay] {:?}: OK (clean replay)",
+                path.file_name().unwrap()
+            ),
             Err(e) => {
                 let msg = format!("{:?}: {e:?}", path.file_name().unwrap());
                 eprintln!("[frozen-replay] CONFLICT/ERR: {msg}");

@@ -30,16 +30,16 @@
 
 mod common;
 
-use p3_batch_stark::ProverData;
 use std::collections::BTreeSet;
 
+use p3_batch_stark::ProverData;
 use p3_circuit::CircuitBuilder;
 use p3_circuit::ops::{
     NpoTypeId, generate_expose_claim_trace, generate_poseidon2_trace, generate_recompose_trace,
 };
 use p3_circuit_prover::batch_stark_prover::{
-    BatchStarkProof, expose_claim_air_builders, expose_claim_table_provers, poseidon2_air_builders,
-    recompose_air_builders,
+    AirVariant, BatchStarkProof, expose_claim_air_builders, expose_claim_table_provers,
+    poseidon2_air_builders, recompose_air_builders,
 };
 use p3_circuit_prover::common::{NpoAirBuilder, NpoPreprocessor, get_airs_and_degrees_with_prep};
 use p3_circuit_prover::{
@@ -50,9 +50,11 @@ use p3_circuit_prover::{
 use p3_field::PrimeCharacteristicRing;
 use p3_lookup::logup::LogUpGadget;
 use p3_poseidon2_circuit_air::KoalaBearD4Width16;
-use p3_recursion::recursion::{CanonicalShapeSpec, check_canonical_shape, inject_canonical_fillers};
 use p3_recursion::Poseidon2Config;
 use p3_recursion::pcs::fri::{FriVerifierParams, InputProofTargets, MerkleCapTargets, RecValMmcs};
+use p3_recursion::recursion::{
+    CanonicalNpoEntry, CanonicalShapeSpec, check_canonical_shape, inject_canonical_fillers,
+};
 use p3_recursion::verifier::verify_p3_batch_proof_circuit;
 use p3_test_utils::koala_bear_params::*;
 use p3_test_utils::test_fri_scalars;
@@ -122,7 +124,9 @@ fn child_verifier_fingerprint(n: usize, min_trace_height: usize) -> Fingerprint 
     let circuit_prover_data =
         CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
     let prover = BatchStarkProver::new(config_proving).with_table_packing(table_packing);
-    let batch_stark_proof = prover.prove_all_tables(&traces, &circuit_prover_data).unwrap();
+    let batch_stark_proof = prover
+        .prove_all_tables(&traces, &circuit_prover_data)
+        .unwrap();
     let common = circuit_prover_data.common_data();
     prover.verify_all_tables(&batch_stark_proof).unwrap();
 
@@ -133,6 +137,7 @@ fn child_verifier_fingerprint(n: usize, min_trace_height: usize) -> Fingerprint 
     let fri_verifier_params = FriVerifierParams::with_mmcs(
         scalars.log_blowup,
         scalars.log_final_poly_len,
+        scalars.num_queries,
         scalars.commit_pow_bits,
         scalars.query_pow_bits,
         Poseidon2Config::KOALA_BEAR_D4_W16,
@@ -325,7 +330,9 @@ fn child_verifier_fingerprint_manifest(
     if expose {
         prover.register_expose_claim_table::<TRACE_D>();
     }
-    let batch_stark_proof = prover.prove_all_tables(&traces, &circuit_prover_data).unwrap();
+    let batch_stark_proof = prover
+        .prove_all_tables(&traces, &circuit_prover_data)
+        .unwrap();
     let common = circuit_prover_data.common_data();
     prover.verify_all_tables(&batch_stark_proof).unwrap();
 
@@ -336,6 +343,7 @@ fn child_verifier_fingerprint_manifest(
     let fri_verifier_params = FriVerifierParams::with_mmcs(
         scalars.log_blowup,
         scalars.log_final_poly_len,
+        scalars.num_queries,
         scalars.commit_pow_bits,
         scalars.query_pow_bits,
         Poseidon2Config::KOALA_BEAR_D4_W16,
@@ -407,7 +415,10 @@ fn fingerprint_varies_with_manifest_when_unpadded() {
     let fp_expose = child_verifier_fingerprint_manifest(48, pad, true);
     println!("bare    (no expose_claim): {fp_bare:?}");
     println!("expose  (+expose_claim):   {fp_expose:?}");
-    assert_eq!(fp_bare.num_instances, 3, "bare child carries 3 primitive tables");
+    assert_eq!(
+        fp_bare.num_instances, 3,
+        "bare child carries 3 primitive tables"
+    );
     assert_eq!(
         fp_expose.num_instances, 4,
         "expose child carries 3 primitive + 1 expose_claim table"
@@ -485,7 +496,10 @@ const TRACE_D4: usize = 4;
 fn canonical_d4_packing(min_trace_height: usize) -> TablePacking {
     TablePacking::new(2, 4)
         .with_min_trace_height(min_trace_height)
-        .with_npo_lanes(NpoTypeId::poseidon2_perm(Poseidon2Config::KOALA_BEAR_D4_W16), 1)
+        .with_npo_lanes(
+            NpoTypeId::poseidon2_perm(Poseidon2Config::KOALA_BEAR_D4_W16),
+            1,
+        )
         .with_npo_lanes(NpoTypeId::recompose(), 1)
         .with_npo_lanes(NpoTypeId::expose_claim(), 1)
 }
@@ -531,14 +545,9 @@ fn build_d4_full_manifest_child(n: usize, padded_from_none: bool) -> CircuitBuil
         // library injector — `bind = expected` is a genuine non-const public witness
         // the recompose + expose fillers consume. `present` is empty: none of the
         // canonical types are used naturally, so all three are padded.
-        let canonical = CanonicalShapeSpec::depth1_default(
-            9,
-            2,
-            4,
-            Poseidon2Config::KOALA_BEAR_D4_W16,
-            1,
-        )
-        .canonical_npos;
+        let canonical =
+            CanonicalShapeSpec::depth1_default(9, 2, 4, Poseidon2Config::KOALA_BEAR_D4_W16, 1)
+                .npo_manifest();
         inject_canonical_fillers::<Challenge, F>(
             &mut builder,
             Poseidon2Config::KOALA_BEAR_D4_W16,
@@ -571,10 +580,7 @@ fn prove_d4_full_manifest_child(
     n: usize,
     min_trace_height: usize,
     padded_from_none: bool,
-) -> (
-    BatchStarkProof<MyConfig>,
-    CircuitProverData<MyConfig>,
-) {
+) -> (BatchStarkProof<MyConfig>, CircuitProverData<MyConfig>) {
     let builder = build_d4_full_manifest_child(n, padded_from_none);
     let table_packing = canonical_d4_packing(min_trace_height);
     let config_proving = make_test_config();
@@ -617,7 +623,9 @@ fn prove_d4_full_manifest_child(
     prover.register_recompose_table::<TRACE_D4>(false);
     prover.register_expose_claim_table::<TRACE_D4>();
 
-    let batch_stark_proof = prover.prove_all_tables(&traces, &circuit_prover_data).unwrap();
+    let batch_stark_proof = prover
+        .prove_all_tables(&traces, &circuit_prover_data)
+        .unwrap();
     prover.verify_all_tables(&batch_stark_proof).unwrap();
     (batch_stark_proof, circuit_prover_data)
 }
@@ -635,7 +643,11 @@ fn d4_manifest(proof: &BatchStarkProof<MyConfig>) -> Vec<String> {
 /// Build the TRACE_D=4 recursive verifier circuit over a D=4 full-manifest child
 /// and return its fingerprint. The child-table prover set carries provers for
 /// ALL three canonical non-primitive types at D=4.
-fn d4_verifier_fingerprint(n: usize, min_trace_height: usize, padded_from_none: bool) -> Fingerprint {
+fn d4_verifier_fingerprint(
+    n: usize,
+    min_trace_height: usize,
+    padded_from_none: bool,
+) -> Fingerprint {
     let (batch_stark_proof, circuit_prover_data) =
         prove_d4_full_manifest_child(n, min_trace_height, padded_from_none);
     let common = circuit_prover_data.common_data();
@@ -645,6 +657,7 @@ fn d4_verifier_fingerprint(n: usize, min_trace_height: usize, padded_from_none: 
     let fri_verifier_params = FriVerifierParams::with_mmcs(
         scalars.log_blowup,
         scalars.log_final_poly_len,
+        scalars.num_queries,
         scalars.commit_pow_bits,
         scalars.query_pow_bits,
         Poseidon2Config::KOALA_BEAR_D4_W16,
@@ -789,10 +802,18 @@ fn matching_spec(proof: &BatchStarkProof<MyConfig>) -> CanonicalShapeSpec {
         log_height: tp.min_trace_height().trailing_zeros() as usize,
         public_lanes: tp.public_lanes(),
         alu_lanes: tp.alu_lanes(),
+        alu_variant: proof.alu_variant,
+        alu_quintic_trinomial: proof.alu_quintic_trinomial,
         canonical_npos: proof
             .non_primitives
             .iter()
-            .map(|e| (e.op_type.clone(), e.lanes))
+            .map(|e| CanonicalNpoEntry {
+                op_type: e.op_type.clone(),
+                lanes: e.lanes,
+                rows: e.rows,
+                public_values_len: e.public_values.len(),
+                air_variant: e.air_variant,
+            })
             .collect(),
     }
 }
@@ -806,15 +827,27 @@ fn check_canonical_shape_accepts_canonical() {
         .expect("a proof that exactly matches its canonical spec must be accepted");
 }
 
-/// NEGATIVE (the soundness tooth): a proof whose manifest/lanes/packing diverge from the
-/// canonical spec is REJECTED — extra table, wrong lanes, missing canonical table, and
-/// off-canonical packing all fail closed. Before the fix the name-only precondition
-/// accepted the extra-table and wrong-lanes cases, so the proof mismatched the canonical VK.
+/// NEGATIVE (the soundness teeth): a proof whose ORDERED manifest / per-entry
+/// lanes+rows+public-arity+air_variant / global ALU selectors / packing diverge from the
+/// canonical spec is REJECTED. Each perturbation is one VK-driving quantity the verifier op-list
+/// reads; the exact check fails closed on every one. The reorder, per-entry-arity (`rows`,
+/// `public_values_len`), and global-ALU cases are the codex round-3 findings — before the fix the
+/// multiset+lanes-only check accepted them yet they induce a different VK.
 #[test]
 fn check_canonical_shape_is_fail_closed() {
     let (proof, _data) = prove_d4_full_manifest_child(48, 64, true);
     let base = matching_spec(&proof);
-    assert_eq!(base.canonical_npos.len(), 3, "canonical D4 manifest is 3 NPOs");
+    assert_eq!(
+        base.canonical_npos.len(),
+        3,
+        "canonical D4 manifest is 3 NPOs"
+    );
+    // Canonical manifest order is [poseidon2_perm, recompose, expose_claim]; expose_claim is
+    // the one entry exposing a public value (its single claim).
+    assert_eq!(
+        base.canonical_npos[2].public_values_len, 1,
+        "the expose_claim entry exposes exactly one public value"
+    );
 
     // (a) EXTRA table in the proof vs the spec: the spec lists FEWER types than the proof
     // carries (drop one). The proof's now-unexpected table must be rejected.
@@ -829,7 +862,13 @@ fn check_canonical_shape_is_fail_closed() {
     // one. The proof's real table for the replaced type matches nothing → reject.
     let mut spec_bogus = base.clone();
     let last = spec_bogus.canonical_npos.len() - 1;
-    spec_bogus.canonical_npos[last] = (NpoTypeId::new("nonexistent_table"), 1);
+    spec_bogus.canonical_npos[last] = CanonicalNpoEntry {
+        op_type: NpoTypeId::new("nonexistent_table"),
+        lanes: 1,
+        rows: 1,
+        public_values_len: 1,
+        air_variant: AirVariant::Baseline,
+    };
     assert!(
         check_canonical_shape(&proof, &spec_bogus).is_err(),
         "a proof missing a canonical type (and carrying a non-canonical one) must be rejected"
@@ -838,7 +877,7 @@ fn check_canonical_shape_is_fail_closed() {
     // (c) WRONG lane count: the spec pins a canonical type at a lane count the proof's
     // table does not have. A different lane count is a different verifier AIR → reject.
     let mut spec_lanes = base.clone();
-    spec_lanes.canonical_npos[0].1 += 1; // bump poseidon2 lanes 1 -> 2
+    spec_lanes.canonical_npos[0].lanes += 1; // bump poseidon2 lanes 1 -> 2
     assert!(
         check_canonical_shape(&proof, &spec_lanes).is_err(),
         "a proof whose canonical table has the WRONG lane count must be rejected"
@@ -861,9 +900,82 @@ fn check_canonical_shape_is_fail_closed() {
         "a proof with a different public-lane packing than canonical must be rejected"
     );
 
+    // (f) CODEX #1 — REORDERED manifest: the SAME tables at the SAME lanes, but in a different
+    // ORDER. The verifier walks the manifest in order, so this builds a different op-list / VK.
+    // The old multiset check accepted it; the ordered check rejects it.
+    let mut spec_reorder = base.clone();
+    spec_reorder.canonical_npos.swap(0, 1); // poseidon2 <-> recompose
+    assert!(
+        check_canonical_shape(&proof, &spec_reorder).is_err(),
+        "a proof whose canonical tables appear in a different ORDER must be rejected (the \
+         verifier op-list is order-sensitive)"
+    );
+
+    // (g) CODEX #2 — WRONG per-entry ROW count (arity): bump the expose_claim claim count.
+    // `ExposeClaimAir` width is `num_claims * D = rows * D`, so a 2-claim entry is a DIFFERENT
+    // AIR than the canonical 1-claim one. The old (op_type, lanes) check accepted it.
+    let mut spec_rows = base.clone();
+    spec_rows.canonical_npos[2].rows += 1; // expose_claim 1 -> 2 claims
+    assert!(
+        check_canonical_shape(&proof, &spec_rows).is_err(),
+        "a proof whose expose_claim carries a different claim count (rows) must be rejected"
+    );
+
+    // (h) CODEX #2 — WRONG per-entry PUBLIC-VALUE count: the verifier pushes one
+    // `air_public_counts` slot of width `public_values.len()` per entry, so a different arity
+    // sizes the public-input allocation differently → different VK.
+    let mut spec_pv = base.clone();
+    spec_pv.canonical_npos[2].public_values_len += 4;
+    assert!(
+        check_canonical_shape(&proof, &spec_pv).is_err(),
+        "a proof whose entry exposes a different number of public values must be rejected"
+    );
+
+    // (i) WRONG per-entry AIR variant: the per-table AIR-variant hook a plugin may branch on.
+    let mut spec_av = base.clone();
+    spec_av.canonical_npos[0].air_variant = AirVariant::Optimized; // proof stamps Baseline
+    assert!(
+        check_canonical_shape(&proof, &spec_av).is_err(),
+        "a proof whose entry carries a different per-table air_variant must be rejected"
+    );
+
+    // (j) CODEX #2 — WRONG global ALU variant: the verifier selects the ALU AIR from
+    // `proof.alu_variant`. The canonical depth-1 proof stamps `Optimized`.
+    let mut spec_alu = base.clone();
+    spec_alu.alu_variant = AirVariant::Baseline;
+    assert!(
+        check_canonical_shape(&proof, &spec_alu).is_err(),
+        "a proof with a different global alu_variant must be rejected"
+    );
+
+    // (k) WRONG global quintic-trinomial flag: feeds `create_alu_air`'s branch.
+    let mut spec_quintic = base.clone();
+    spec_quintic.alu_quintic_trinomial = !spec_quintic.alu_quintic_trinomial;
+    assert!(
+        check_canonical_shape(&proof, &spec_quintic).is_err(),
+        "a proof with a different alu_quintic_trinomial flag must be rejected"
+    );
+
     // Sanity: the unperturbed spec still accepts — the rejections above are specific, not
     // a blanket failure.
     check_canonical_shape(&proof, &base).expect("the unperturbed canonical spec must accept");
+}
+
+/// POSITIVE (validates the HARDCODED canonical values): a canonical D=4 child built and proved
+/// against the canonical packing is accepted by the spec produced by
+/// [`CanonicalShapeSpec::depth1_default`] — i.e. the per-entry `rows`/`public_values_len`/
+/// `air_variant` and the global `alu_variant`/`alu_quintic_trinomial` the constructor hardcodes
+/// match what the prover actually stamps. (`prove_d4_full_manifest_child(48, 64, ..)` proves at
+/// min_trace_height=64 → log_height=6; the EFFECTIVE post-clamp primitive lanes are 1/1 and the
+/// npo lanes are 1.)
+#[test]
+fn depth1_default_accepts_canonical_child() {
+    let (proof, _data) = prove_d4_full_manifest_child(48, 64, true);
+    let spec = CanonicalShapeSpec::depth1_default(6, 1, 1, Poseidon2Config::KOALA_BEAR_D4_W16, 1);
+    check_canonical_shape(&proof, &spec).expect(
+        "the depth1_default canonical spec must accept a real canonical child — if this fails, a \
+         hardcoded canonical quantity (rows/public_values_len/air_variant/alu_*) is wrong",
+    );
 }
 
 // ---- F3: the recompose/coeff filler now emits a `recompose/coeff` table from DEFAULT
@@ -896,7 +1008,10 @@ fn build_d4_coeff_manifest_child(n: usize) -> CircuitBuilder<Challenge> {
 
     // Canonical manifest with the RECOMPOSE/COEFF variant in the recompose slot.
     let canonical_npos = vec![
-        (NpoTypeId::poseidon2_perm(Poseidon2Config::KOALA_BEAR_D4_W16), 1usize),
+        (
+            NpoTypeId::poseidon2_perm(Poseidon2Config::KOALA_BEAR_D4_W16),
+            1usize,
+        ),
         (NpoTypeId::recompose_with_coeff_lookups(), 1usize),
         (NpoTypeId::expose_claim(), 1usize),
     ];
@@ -917,7 +1032,10 @@ fn prove_d4_coeff_manifest_child(n: usize, min_trace_height: usize) -> BatchStar
     let builder = build_d4_coeff_manifest_child(n);
     let table_packing = TablePacking::new(2, 4)
         .with_min_trace_height(min_trace_height)
-        .with_npo_lanes(NpoTypeId::poseidon2_perm(Poseidon2Config::KOALA_BEAR_D4_W16), 1)
+        .with_npo_lanes(
+            NpoTypeId::poseidon2_perm(Poseidon2Config::KOALA_BEAR_D4_W16),
+            1,
+        )
         .with_npo_lanes(NpoTypeId::recompose_with_coeff_lookups(), 1)
         .with_npo_lanes(NpoTypeId::expose_claim(), 1);
     let config_proving = make_test_config();
@@ -960,7 +1078,9 @@ fn prove_d4_coeff_manifest_child(n: usize, min_trace_height: usize) -> BatchStar
     prover.register_recompose_table::<TRACE_D4>(true);
     prover.register_expose_claim_table::<TRACE_D4>();
 
-    let proof = prover.prove_all_tables(&traces, &circuit_prover_data).unwrap();
+    let proof = prover
+        .prove_all_tables(&traces, &circuit_prover_data)
+        .unwrap();
     prover.verify_all_tables(&proof).unwrap();
     proof
 }

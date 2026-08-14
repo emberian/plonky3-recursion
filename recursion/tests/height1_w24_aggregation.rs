@@ -26,10 +26,12 @@
 
 mod common;
 
+use p3_baby_bear::{BabyBear, default_babybear_poseidon2_16, default_babybear_poseidon2_24};
 use p3_batch_stark::ProverData;
+use p3_challenger::DuplexChallenger;
 use p3_circuit::CircuitBuilder;
 use p3_circuit::ops::{
-    Poseidon2Config, PermConfig, generate_poseidon2_trace, generate_recompose_trace,
+    PermConfig, Poseidon2Config, generate_poseidon2_trace, generate_recompose_trace,
 };
 use p3_circuit_prover::batch_stark_prover::poseidon2_air_builders;
 use p3_circuit_prover::common::{NpoPreprocessor, get_airs_and_degrees_with_prep};
@@ -37,28 +39,20 @@ use p3_circuit_prover::{
     BatchStarkProver, CircuitProverData, ConstraintProfile, Poseidon2Preprocessor, Poseidon2Prover,
     RecomposePreprocessor, TablePacking, TableProver,
 };
+use p3_commit::ExtensionMmcs;
 use p3_dft::Radix2DitParallel;
-use p3_field::{BasedVectorSpace, PrimeCharacteristicRing};
 use p3_field::extension::BinomialExtensionField;
+use p3_field::{BasedVectorSpace, Field, PrimeCharacteristicRing};
 use p3_fri::{FriParameters, TwoAdicFriPcs};
 use p3_lookup::logup::LogUpGadget;
+use p3_merkle_tree::MerkleTreeMmcs;
 use p3_poseidon2_circuit_air::{BabyBearD4Width16, BabyBearD4Width24};
-use p3_recursion::pcs::fri::{
-    FriVerifierParams, InputProofTargets, MerkleCapTargets, RecValMmcs,
-};
+use p3_recursion::pcs::fri::{FriVerifierParams, InputProofTargets, MerkleCapTargets, RecValMmcs};
 use p3_recursion::pcs::set_fri_mmcs_private_data;
 use p3_recursion::verifier::verify_p3_batch_proof_circuit;
 use p3_recursion::{Poseidon2Config as RecPoseidon2Config, VerificationError};
-use p3_uni_stark::StarkConfig;
-
-use p3_baby_bear::{
-    BabyBear, default_babybear_poseidon2_16, default_babybear_poseidon2_24,
-};
-use p3_challenger::DuplexChallenger;
-use p3_commit::ExtensionMmcs;
-use p3_field::Field;
-use p3_merkle_tree::MerkleTreeMmcs;
 use p3_symmetric::{PaddingFreeSponge, Permutation, TruncatedPermutation};
+use p3_uni_stark::StarkConfig;
 
 use crate::common::InnerFriGeneric;
 
@@ -72,8 +66,14 @@ type Dft = Radix2DitParallel<F>;
 type Perm = p3_baby_bear::Poseidon2BabyBear<WIDTH>;
 type MyHash = PaddingFreeSponge<Perm, WIDTH, RATE, DIGEST_ELEMS>;
 type MyCompress = TruncatedPermutation<Perm, 2, DIGEST_ELEMS, WIDTH>;
-type MyMmcs =
-    MerkleTreeMmcs<<F as Field>::Packing, <F as Field>::Packing, MyHash, MyCompress, 2, DIGEST_ELEMS>;
+type MyMmcs = MerkleTreeMmcs<
+    <F as Field>::Packing,
+    <F as Field>::Packing,
+    MyHash,
+    MyCompress,
+    2,
+    DIGEST_ELEMS,
+>;
 type ChallengeMmcs = ExtensionMmcs<F, Challenge, MyMmcs>;
 type Challenger = DuplexChallenger<F, Perm, WIDTH, RATE>;
 type MyPcs = TwoAdicFriPcs<F, Dft, MyMmcs, ChallengeMmcs>;
@@ -105,6 +105,7 @@ fn fri_verifier_params() -> FriVerifierParams {
     FriVerifierParams::with_mmcs(
         3,
         0,
+        38,
         0,
         14,
         PermConfig::poseidon2(Poseidon2Config::BABY_BEAR_D4_W16),
@@ -137,6 +138,7 @@ fn fri_verifier_params_lb(log_blowup: usize) -> FriVerifierParams {
     FriVerifierParams::with_mmcs(
         log_blowup,
         0,
+        38,
         0,
         14,
         PermConfig::poseidon2(Poseidon2Config::BABY_BEAR_D4_W16),
@@ -194,8 +196,8 @@ fn prove_inner_with_one_w24_perm(
     }
     let base_out = Permutation::permute(&perm24, base);
     // ext limb 0 = base lanes [0..4] as the 4 coeffs.
-    let expected_out0 = Challenge::from_basis_coefficients_slice(&base_out[0..D])
-        .expect("valid ext coeffs");
+    let expected_out0 =
+        Challenge::from_basis_coefficients_slice(&base_out[0..D]).expect("valid ext coeffs");
     runner.set_public_inputs(&[expected_out0]).unwrap();
     let traces = runner.run().unwrap();
 
@@ -302,9 +304,8 @@ fn prove_inner_mixed_height_perm(
             state[limb * D] = tag_k_v;
         }
         let out = Permutation::permute(&perm16, state);
-        public_vals.push(
-            Challenge::from_basis_coefficients_slice(&out[0..D]).expect("valid ext coeffs"),
-        );
+        public_vals
+            .push(Challenge::from_basis_coefficients_slice(&out[0..D]).expect("valid ext coeffs"));
     }
 
     let mut w24_base = [BabyBear::ZERO; 24];
@@ -312,8 +313,8 @@ fn prove_inner_mixed_height_perm(
         w24_base[limb * D] = tag_v;
     }
     let w24_base_out = Permutation::permute(&perm24, w24_base);
-    let w24_out0 = Challenge::from_basis_coefficients_slice(&w24_base_out[0..D])
-        .expect("valid ext coeffs");
+    let w24_out0 =
+        Challenge::from_basis_coefficients_slice(&w24_base_out[0..D]).expect("valid ext coeffs");
     public_vals.push(w24_out0);
 
     runner.set_public_inputs(&public_vals).unwrap();
@@ -726,9 +727,10 @@ fn height1_w24_two_level_aggregation_folds() -> Result<(), VerificationError> {
         Box::new(p3_circuit_prover::ExposeClaimPreprocessor::new()),
     ];
     let mut l1_air_builders = poseidon2_air_builders::<MyConfig, D>();
-    l1_air_builders
-        .extend(p3_circuit_prover::batch_stark_prover::recompose_air_builders(1, false));
-    l1_air_builders.push(Box::new(p3_circuit_prover::ExposeClaimAirBuilder::<D>::new()));
+    l1_air_builders.extend(p3_circuit_prover::batch_stark_prover::recompose_air_builders(1, false));
+    l1_air_builders.push(Box::new(
+        p3_circuit_prover::ExposeClaimAirBuilder::<D>::new(),
+    ));
     let (l1_airs_degrees, l1_prim, l1_nonprim) =
         get_airs_and_degrees_with_prep::<MyConfig, Challenge, D>(
             &verification_circuit,

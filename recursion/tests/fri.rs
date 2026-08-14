@@ -306,17 +306,22 @@ struct FriSetup {
     perm: Perm,
     log_blowup: usize,
     log_final_poly_len: usize,
+    /// The CONFIGURED query count, read off `FriParameters`. The verifier pins
+    /// the proof's query count against this; it is never derived from a proof.
+    num_queries: usize,
     query_pow_bits: usize,
     commit_pow_bits: usize,
     group_sizes: Vec<Vec<u8>>,
 }
 
 impl FriSetup {
+    #[allow(clippy::too_many_arguments)]
     const fn new(
         pcs: MyPcs,
         perm: Perm,
         log_blowup: usize,
         log_final_poly_len: usize,
+        num_queries: usize,
         query_pow_bits: usize,
         commit_pow_bits: usize,
         group_sizes: Vec<Vec<u8>>,
@@ -326,6 +331,7 @@ impl FriSetup {
             perm,
             log_blowup,
             log_final_poly_len,
+            num_queries,
             query_pow_bits,
             commit_pow_bits,
             group_sizes,
@@ -345,6 +351,7 @@ fn generate_setup(log_final_poly_len: usize, group_sizes: Vec<Vec<u8>>) -> FriSe
     let fri_params = FriParameters::new_testing(challenge_mmcs, log_final_poly_len);
     let log_blowup = fri_params.log_blowup;
     let log_final_poly_len = fri_params.log_final_poly_len;
+    let num_queries = fri_params.num_queries;
     let query_pow_bits = fri_params.query_proof_of_work_bits;
     let commit_pow_bits = fri_params.commit_proof_of_work_bits;
     let pcs = MyPcs::new(dft, val_mmcs, fri_params);
@@ -354,6 +361,7 @@ fn generate_setup(log_final_poly_len: usize, group_sizes: Vec<Vec<u8>>) -> FriSe
         perm,
         log_blowup,
         log_final_poly_len,
+        num_queries,
         query_pow_bits,
         commit_pow_bits,
         group_sizes,
@@ -366,6 +374,7 @@ fn run_fri_test(setup: FriSetup, build_only: bool) {
         perm,
         log_blowup,
         log_final_poly_len,
+        num_queries: configured_num_queries,
         query_pow_bits,
         commit_pow_bits,
         group_sizes,
@@ -459,6 +468,7 @@ fn run_fri_test(setup: FriSetup, build_only: bool) {
             &index_bits_t_per_query,
             &commitments_with_opening_points_targets,
             log_blowup,
+            configured_num_queries,
             None, // MMCS verification disabled
         )
         .unwrap();
@@ -552,6 +562,7 @@ fn run_fri_test_with_mmcs(setup: FriSetup) {
         perm,
         log_blowup,
         log_final_poly_len,
+        num_queries: configured_num_queries,
         query_pow_bits,
         commit_pow_bits,
         group_sizes,
@@ -665,6 +676,7 @@ fn run_fri_test_with_mmcs(setup: FriSetup) {
         &index_bits_t_per_query,
         &commitments_with_opening_points_targets,
         log_blowup,
+        configured_num_queries,
         Some(Poseidon2Config::BABY_BEAR_D4_W16.into()),
     )
     .unwrap();
@@ -801,6 +813,7 @@ fn test_circuit_fri_verifier_with_mmcs() {
 fn try_build_fri_verifier(
     result: &ProduceInputsResult,
     log_blowup: usize,
+    expected_num_queries: usize,
 ) -> Result<(), VerificationError> {
     let num_phases = result.num_phases;
     let log_max_height = result.log_max_height;
@@ -843,6 +856,7 @@ fn try_build_fri_verifier(
         &index_bits_t_per_query,
         &commitments_with_opening_points_targets,
         log_blowup,
+        expected_num_queries,
         None, // MMCS verification disabled; we only exercise shape validation.
     )
     .map(|_| ())
@@ -870,7 +884,7 @@ fn test_fri_verifier_rejects_per_query_schedule_mismatch() {
     );
 
     // Sanity: the untampered proof passes shape validation.
-    try_build_fri_verifier(&result, setup.log_blowup)
+    try_build_fri_verifier(&result, setup.log_blowup, setup.num_queries)
         .expect("untampered FRI proof must pass shape validation");
 
     // --- Case 1: a non-first query's `log_arity` diverges from the global schedule
@@ -890,7 +904,7 @@ fn test_fri_verifier_rejects_per_query_schedule_mismatch() {
         // second query no longer matches query 0's schedule.
         step.log_arity += 1;
     }
-    let err = try_build_fri_verifier(&tampered, setup.log_blowup)
+    let err = try_build_fri_verifier(&tampered, setup.log_blowup, setup.num_queries)
         .expect_err("per-query log_arity divergence must be rejected");
     assert!(
         matches!(err, VerificationError::InvalidProofShape(_)),
@@ -900,7 +914,7 @@ fn test_fri_verifier_rejects_per_query_schedule_mismatch() {
     // --- Case 2: a non-first query drops a commit-phase opening, so its
     // opening count no longer matches the number of phases.
     result.fri_proof.query_proofs[1].commit_phase_openings.pop();
-    let err = try_build_fri_verifier(&result, setup.log_blowup)
+    let err = try_build_fri_verifier(&result, setup.log_blowup, setup.num_queries)
         .expect_err("per-query commit-phase opening count mismatch must be rejected");
     assert!(
         matches!(err, VerificationError::InvalidProofShape(_)),
@@ -933,10 +947,142 @@ fn test_fri_verifier_rejects_zero_query_proof() {
     result.index_bits_per_query.clear();
     result.num_phases = 0;
 
-    let err = try_build_fri_verifier(&result, setup.log_blowup)
+    // Configure the verifier for zero queries too, so this test still exercises the
+    // dedicated zero-query refusal rather than being short-circuited by the
+    // configured-count pin (which fires first and would otherwise make this test
+    // stop testing what it names).
+    let err = try_build_fri_verifier(&result, setup.log_blowup, 0)
         .expect_err("zero-query FRI proof must be rejected, not panic");
+    let VerificationError::InvalidProofShape(msg) = &err else {
+        panic!("expected InvalidProofShape, got {err:?}");
+    };
     assert!(
-        matches!(err, VerificationError::InvalidProofShape(_)),
-        "expected InvalidProofShape, got {err:?}"
+        msg.contains("at least one query"),
+        "this test must trip the zero-query refusal, got: {msg}"
+    );
+}
+
+/// **The query count is a soundness parameter and must come from the config, not
+/// the proof.**
+///
+/// FRI query soundness is linear in the query count: at the deployed dregg IR-v2
+/// point (`log_blowup = 6`, `19` queries, `16` query-PoW bits) the proven
+/// unique-decoding column reads 34 bits and the idealised Johnson column 73; a
+/// proof carrying a single query reads **16 and 19** — essentially the grinding
+/// floor. (`minidregg/Assurance/TwoRegimeQueryBudget.lean`,
+/// `unpinned_query_count_collapses_the_column`.)
+///
+/// This is a **constructive** falsifier, not a transcript-desync test: it takes a
+/// real, passing FRI proof, *removes query proofs from it*, asserts the removal
+/// actually happened, and only then reads the verdict. If a future refactor makes
+/// the mutation a no-op the `assert_ne!`/`assert_eq!` on the mutated shape fails
+/// loudly instead of the test quietly passing on an unmutated proof.
+#[test]
+fn test_fri_verifier_pins_query_count_against_config() {
+    let setup = generate_setup(
+        0,
+        vec![vec![0u8, 5, 8, 8, 10], vec![8u8, 11], vec![4u8, 5, 8]],
+    );
+    let configured = setup.num_queries;
+    assert!(
+        configured >= 2,
+        "this test needs a config with at least two queries so a query can be dropped \
+         and the proof still be non-degenerate; configured = {configured}"
+    );
+
+    let honest = produce_inputs_multi(
+        &setup.pcs,
+        &setup.perm,
+        setup.log_blowup,
+        setup.log_final_poly_len,
+        (setup.commit_pow_bits, setup.query_pow_bits),
+        &setup.group_sizes,
+        0,
+    );
+    assert_eq!(
+        honest.fri_proof.query_proofs.len(),
+        configured,
+        "the honest prover must emit exactly the configured number of queries"
+    );
+
+    // Positive control: at the configured count the verifier accepts.
+    try_build_fri_verifier(&honest, setup.log_blowup, configured)
+        .expect("an honest proof at the configured query count must pass shape validation");
+
+    // --- Case 1: the attack. Mint a proof with FEWER queries than configured.
+    let mut weakened = produce_inputs_multi(
+        &setup.pcs,
+        &setup.perm,
+        setup.log_blowup,
+        setup.log_final_poly_len,
+        (setup.commit_pow_bits, setup.query_pow_bits),
+        &setup.group_sizes,
+        0,
+    );
+    let before = weakened.fri_proof.query_proofs.len();
+    while weakened.fri_proof.query_proofs.len() > 1 {
+        weakened.fri_proof.query_proofs.pop();
+        weakened.index_bits_per_query.pop();
+    }
+    // Assert the mutation TOOK EFFECT before reading any verdict.
+    assert_eq!(
+        weakened.fri_proof.query_proofs.len(),
+        1,
+        "the weakening mutation must leave exactly one query proof"
+    );
+    assert_ne!(
+        weakened.fri_proof.query_proofs.len(),
+        before,
+        "the weakening mutation must actually have removed query proofs"
+    );
+    assert_eq!(
+        weakened.index_bits_per_query.len(),
+        1,
+        "index bits must track the mutated query count, or the refusal below would \
+         be diagnosing the index-bit shape rather than the query count"
+    );
+
+    let err = try_build_fri_verifier(&weakened, setup.log_blowup, configured)
+        .expect_err("a proof with fewer queries than configured must be REFUSED");
+    let VerificationError::InvalidProofShape(msg) = &err else {
+        panic!("expected InvalidProofShape, got {err:?}");
+    };
+    assert!(
+        msg.contains("configured number of queries")
+            && msg.contains(&format!("expected {configured}"))
+            && msg.contains("got 1"),
+        "the refusal must name the query-count pin and both counts, got: {msg}"
+    );
+
+    // --- Case 2: the pin is an EQUALITY, not a lower bound. A proof carrying more
+    // queries than configured is also refused (the Fiat-Shamir transcript would
+    // otherwise diverge from the native verifier's).
+    let mut inflated = produce_inputs_multi(
+        &setup.pcs,
+        &setup.perm,
+        setup.log_blowup,
+        setup.log_final_poly_len,
+        (setup.commit_pow_bits, setup.query_pow_bits),
+        &setup.group_sizes,
+        0,
+    );
+    let extra = inflated.fri_proof.query_proofs[0].clone();
+    let extra_bits = inflated.index_bits_per_query[0].clone();
+    inflated.fri_proof.query_proofs.push(extra);
+    inflated.index_bits_per_query.push(extra_bits);
+    assert_eq!(
+        inflated.fri_proof.query_proofs.len(),
+        configured + 1,
+        "the inflation mutation must actually have added a query proof"
+    );
+
+    let err = try_build_fri_verifier(&inflated, setup.log_blowup, configured)
+        .expect_err("a proof with more queries than configured must be REFUSED");
+    let VerificationError::InvalidProofShape(msg) = &err else {
+        panic!("expected InvalidProofShape, got {err:?}");
+    };
+    assert!(
+        msg.contains("configured number of queries"),
+        "the refusal must name the query-count pin, got: {msg}"
     );
 }

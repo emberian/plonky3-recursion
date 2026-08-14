@@ -117,6 +117,7 @@ fn test_fibonacci_batch_verifier_quintic_koala() {
     let fri_verifier_params = FriVerifierParams::with_mmcs(
         scalars.log_blowup,
         scalars.log_final_poly_len,
+        scalars.num_queries,
         scalars.commit_pow_bits,
         scalars.query_pow_bits,
         Poseidon2Config::KOALA_BEAR_D1_W16,
