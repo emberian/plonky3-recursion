@@ -69,6 +69,24 @@ pub enum CircuitError {
     #[error("Division by zero encountered")]
     DivisionByZero,
 
+    /// A `HornerAcc` op list violates the implicit-accumulator chain contract.
+    ///
+    /// `Op::Alu { kind: HornerAcc, .. }` does **not** constrain its accumulator: the AIR takes
+    /// it from the previous row's `out` column, and `AluAir::compute_schedule` recovers chains
+    /// as maximal runs of *adjacent* `HornerAcc` ops, seeding each run from a zero separator
+    /// row. An emitter must therefore start every chain from a zero-valued witness and never
+    /// place two independent chains back to back. Breaking either produces a trace the ALU AIR
+    /// rejects, and the only symptom is an `OodEvaluationMismatch` against the ALU table —
+    /// which names nothing. This error names it.
+    #[error(
+        "HornerAcc chain contract violated at op {op_index}: {reason}. The accumulator of a \
+         HornerAcc op is NOT a constrained operand — the AIR reads it from the previous row's \
+         `out`, and AluAir::compute_schedule treats every maximal run of adjacent HornerAcc ops \
+         as one chain seeded from a zero separator. Emit each chain starting from a zero witness \
+         and separate independent chains with at least one non-HornerAcc op."
+    )]
+    HornerChainContractViolated { op_index: usize, reason: String },
+
     /// Invalid bit value in SampleBits bit decomposition (must be 0 or 1).
     #[error(
         "Invalid bit value in SampleBits bit decomposition for WitnessId({input_witness_id}): {bit_value} (must be 0 or 1)"

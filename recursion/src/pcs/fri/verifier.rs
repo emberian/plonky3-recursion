@@ -1030,6 +1030,119 @@ fn compute_single_reduced_opening<EF: Field>(
     (new_alpha_pow, reduced_opening)
 }
 
+/// Reduced opening for a matrix opened at **two or more** points, with the per-query Horner
+/// chain **shared across the points**.
+///
+/// A matrix of width `n` opened at points `z_1 .. z_P`, entering at ladder power `A`,
+/// contributes exactly
+///
+/// ```text
+///   Σ_j  A·α^{(j-1)n} · (z_j - x)^{-1} · Σ_i α^i (p_{z_j}[i] - p_x[i])
+/// ```
+///
+/// and the inner sum splits as `Q_j - R` with
+///
+/// ```text
+///   Q_j = Σ_i α^i p_{z_j}[i]     R = Σ_i α^i p_x[i]
+/// ```
+///
+/// Two facts make the split pay:
+///
+/// * `R` does not depend on `j`, so **one** chain serves all `P` points instead of `P`;
+/// * `Q_j` depends only on `alpha` and the OOD opened values — the *same* `Target`s at every
+///   FRI query — so the builder's `horner_acc_pool` CSE emits each `Q_j` **once for the whole
+///   circuit**, not once per query.
+///
+/// Per-query Horner cost therefore falls from `P·n` to `n`, against a one-off `P·n`.
+/// At the deployed `q = 19, P = 2` that is `38n → 21n`.
+///
+/// ⚑ This is a **re-association of the same field expression**, not a protocol change: the
+/// value of `ro` is identical to `compute_single_reduced_opening`'s, so the FRI fold sees the
+/// same input word and the child proof is unchanged. What moves is the wrap's own op list
+/// (hence its VK).
+///
+/// ## ⚠ The `HornerAcc` chain contract this function must respect
+///
+/// `Op::horner_acc`'s accumulator is **not a constrained operand**: `ops/op.rs` — *"In the AIR,
+/// the accumulator comes implicitly from the previous row's `out` column"* — and
+/// `AluAir::compute_schedule` recovers chains as **maximal runs of adjacent `HornerAcc` ops in
+/// the op list**, seeding each run from a zero `Separator` row. So an emitter must
+///
+/// 1. start every chain from a **zero** accumulator, and
+/// 2. never place two independent chains **back to back** in the op list.
+///
+/// Violating either produces a trace the ALU AIR rejects, surfacing only as
+/// `OodEvaluationMismatch` against the ALU table — with nothing naming the cause. Every chain
+/// below is therefore seeded at `zero` and bracketed by the `mul`/`sub` it needs anyway.
+fn compute_multipoint_reduced_opening<EF: Field>(
+    builder: &mut CircuitBuilder<EF>,
+    opened_values: &[Target], // p_x — the Merkle-opened row, one per column
+    points_and_values: &[(Target, Vec<Target>)], // (z_j, p_{z_j}), in ladder order
+    alpha_pow: Target,        // ladder power entering this matrix
+    alpha: Target,
+    alpha_powers_set: &mut HashMap<usize, Target>,
+    inv_z_minus_x: &[Target], // 1/(z_j - x), same order and length as `points_and_values`
+) -> (Target, Target) // (new_alpha_pow, reduced_opening_contrib)
+{
+    builder.push_scope("compute_multipoint_reduced_opening");
+
+    let n = opened_values.len();
+    let p = points_and_values.len();
+    debug_assert!(p >= 2, "single-point matrices keep the fused Horner chain");
+    debug_assert_eq!(inv_z_minus_x.len(), p);
+
+    if n == 0 {
+        let zero = builder.define_const(EF::ZERO);
+        builder.pop_scope();
+        return (alpha_pow, zero);
+    }
+
+    // `alpha_horner(vals) = Σ_i α^i vals[i]`, as a reverse-Horner chain **seeded at zero** (see
+    // the chain contract above). The `p_at_x` slot carries the additive identity, so every step
+    // is a single `HornerAcc`, exactly as in the fused form.
+    let zero = builder.define_const(EF::ZERO);
+    let alpha_horner = |builder: &mut CircuitBuilder<EF>, vals: &[Target]| -> Target {
+        let mut acc = zero;
+        for i in (0..n).rev() {
+            acc = builder.horner_acc_step(acc, alpha, vals[i], zero);
+        }
+        acc
+    };
+
+    // R — the only query-dependent chain. Bracketed below: whatever the caller emitted last is
+    // not a `HornerAcc` (the ladder `mul`/`add` tail of the previous matrix), and the first op
+    // after it is the `mul` that opens the point loop.
+    let r = alpha_horner(builder, opened_values);
+
+    let alpha_n = if let Some(alpha_n) = alpha_powers_set.get(&n) {
+        *alpha_n
+    } else {
+        let alpha_n = circuit_exp_by_constant(builder, alpha, n);
+        alpha_powers_set.insert(n, alpha_n);
+        alpha_n
+    };
+
+    let mut ro = zero;
+    let mut a = alpha_pow;
+    for (j, ((_z, ps_at_z), inv)) in points_and_values.iter().zip(inv_z_minus_x).enumerate() {
+        // `mul` FIRST: it is the non-`HornerAcc` op that closes the preceding chain's run.
+        let c = builder.mul(a, *inv);
+        // Q_j — pure in (alpha, ps_at_z); CSE shares it across every query.
+        let q = alpha_horner(builder, ps_at_z);
+        // `sub` closes this chain's run before the next `mul` opens the next one.
+        let inner = builder.sub(q, r);
+        ro = builder.mul_add(c, inner, ro);
+        if j + 1 < p {
+            a = builder.mul(a, alpha_n);
+        }
+    }
+    // Close the ladder: the entering power advanced by `alpha^n` once per point.
+    let new_alpha_pow = builder.mul(a, alpha_n);
+
+    builder.pop_scope();
+    (new_alpha_pow, ro)
+}
+
 /// Computes `base^n` in-circuit using square-and-multiply.
 ///
 /// Cost: `floor(log2(n)) + popcount(n) - 1` multiplications.
@@ -1278,42 +1391,62 @@ where
                 // alpha_pow *= alpha^total_n
                 *alpha_pow_h = builder.mul(alpha_pow_old, alpha_total_n);
             } else {
-                // Fallback: per-matrix per-z, identical to the original implementation.
+                // Per-matrix. A matrix opened at ONE point keeps the fused
+                // `compute_single_reduced_opening`; a matrix opened at P >= 2 points takes the
+                // point-shared split (`compute_multipoint_reduced_opening`), which pays one
+                // Horner chain over the opened row instead of P of them.
                 for (mat_opening, points_and_values) in matrices {
-                    for (z, ps_at_z) in points_and_values.iter() {
-                        let inv_z_minus_x = *inv_z_minus_x_cache
-                            .entry((*log_height, *z))
-                            .or_insert_with(|| {
-                                let z_minus_x = builder.sub(*z, x);
-                                let one = builder.define_const(EF::ONE);
-                                builder.div(one, z_minus_x)
+                    // Resolve `1/(z - x)` for every point of this matrix up front, so the
+                    // multi-point helper can borrow the builder freely.
+                    let invs: Vec<Target> = points_and_values
+                        .iter()
+                        .map(|(z, _)| {
+                            *inv_z_minus_x_cache
+                                .entry((*log_height, *z))
+                                .or_insert_with(|| {
+                                    let z_minus_x = builder.sub(*z, x);
+                                    let one = builder.define_const(EF::ONE);
+                                    builder.div(one, z_minus_x)
+                                })
+                        })
+                        .collect();
+
+                    let alpha_pow_value = {
+                        let (alpha_pow_h, _ro_h) =
+                            reduced_openings.entry(*log_height).or_insert_with(|| {
+                                (
+                                    builder.define_const(EF::ONE),
+                                    builder.define_const(EF::ZERO),
+                                )
                             });
+                        *alpha_pow_h
+                    };
 
-                        let alpha_pow_value = {
-                            let (alpha_pow_h, _ro_h) =
-                                reduced_openings.entry(*log_height).or_insert_with(|| {
-                                    (
-                                        builder.define_const(EF::ONE),
-                                        builder.define_const(EF::ZERO),
-                                    )
-                                });
-                            *alpha_pow_h
-                        };
-
-                        let (new_alpha_pow_h, ro_contrib) = compute_single_reduced_opening(
+                    let (new_alpha_pow_h, ro_contrib) = if points_and_values.len() >= 2 {
+                        compute_multipoint_reduced_opening(
                             builder,
                             mat_opening,
-                            ps_at_z,
+                            points_and_values,
                             alpha_pow_value,
                             alpha,
                             &mut alpha_powers_set,
-                            inv_z_minus_x,
-                        );
+                            &invs,
+                        )
+                    } else {
+                        compute_single_reduced_opening(
+                            builder,
+                            mat_opening,
+                            &points_and_values[0].1,
+                            alpha_pow_value,
+                            alpha,
+                            &mut alpha_powers_set,
+                            invs[0],
+                        )
+                    };
 
-                        let entry = reduced_openings.get_mut(log_height).expect("entry");
-                        entry.1 = builder.add(entry.1, ro_contrib);
-                        entry.0 = new_alpha_pow_h;
-                    }
+                    let entry = reduced_openings.get_mut(log_height).expect("entry");
+                    entry.1 = builder.add(entry.1, ro_contrib);
+                    entry.0 = new_alpha_pow_h;
                 }
             }
         }

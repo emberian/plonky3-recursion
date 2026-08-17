@@ -237,6 +237,89 @@ impl<F: Field> Circuit<F> {
     ///
     /// Returns a [`PreprocessedColumns`] with one primitive entry per [`PrimitiveOpType`]:
     ///
+    /// ⚑ **The `HornerAcc` implicit-accumulator chain contract, checked.**
+    ///
+    /// `Op::Alu { kind: HornerAcc, .. }` carries its accumulator in `intermediate_out`, which is
+    /// **not a constrained operand**: `AluAir` reads the accumulator from the *previous row's*
+    /// `out` column, and `AluAir::compute_schedule` recovers chains as **maximal runs of
+    /// adjacent `HornerAcc` ops in this op list**, seeding each run from a zero `Separator` row.
+    ///
+    /// Two obligations fall on every emitter, and nothing used to check either:
+    ///
+    /// 1. the **first** op of a run must accumulate from a zero-valued witness (the separator
+    ///    supplies zero, so any other seed is unrepresentable);
+    /// 2. within a run, op `i+1`'s accumulator must be op `i`'s `out` — i.e. two independent
+    ///    chains may not sit back to back.
+    ///
+    /// A violation is a *completeness* break, not a soundness one (the preprocessed columns are
+    /// part of the VK), but it surfaces only as `OodEvaluationMismatch` against the ALU table,
+    /// which names neither the op nor the cause. Returns
+    /// [`CircuitError::HornerChainContractViolated`] instead.
+    fn validate_horner_chain_contract(&self) -> Result<(), CircuitError> {
+        // Witnesses a `Const` op sets to zero — the only legal chain seeds.
+        let mut zero_consts: hashbrown::HashSet<u32> = hashbrown::HashSet::new();
+        for op in &self.ops {
+            if let Op::Const { out, val } = op
+                && val.is_zero()
+            {
+                zero_consts.insert(out.0);
+            }
+        }
+
+        // `Some(out)` while walking a run of adjacent HornerAcc ops.
+        let mut prev_horner_out: Option<WitnessId> = None;
+        for (i, op) in self.ops.iter().enumerate() {
+            let Op::Alu {
+                kind: AluOpKind::HornerAcc,
+                out,
+                intermediate_out,
+                ..
+            } = op
+            else {
+                prev_horner_out = None;
+                continue;
+            };
+
+            let acc =
+                intermediate_out.ok_or_else(|| CircuitError::HornerChainContractViolated {
+                    op_index: i,
+                    reason: alloc::string::String::from(
+                        "HornerAcc op has no accumulator in `intermediate_out`",
+                    ),
+                })?;
+
+            match prev_horner_out {
+                // Continuing a run: the accumulator must be the previous step's output.
+                Some(prev) if acc != prev => {
+                    return Err(CircuitError::HornerChainContractViolated {
+                        op_index: i,
+                        reason: alloc::format!(
+                            "accumulates from WitnessId({}) but the adjacent preceding HornerAcc \
+                             produced WitnessId({}) — two independent chains are back to back",
+                            acc.0,
+                            prev.0
+                        ),
+                    });
+                }
+                // Opening a run: the accumulator must be a zero constant.
+                None if !zero_consts.contains(&acc.0) => {
+                    return Err(CircuitError::HornerChainContractViolated {
+                        op_index: i,
+                        reason: alloc::format!(
+                            "opens a chain accumulating from WitnessId({}), which is not a zero \
+                             constant; the separator row supplies zero, so any other seed is \
+                             unrepresentable",
+                            acc.0
+                        ),
+                    });
+                }
+                _ => {}
+            }
+            prev_horner_out = Some(*out);
+        }
+        Ok(())
+    }
+
     /// | Index | Operation | Column Layout                                                              | Width (per op) |
     /// |-------|-----------|----------------------------------------------------------------------------|----------------|
     /// | 0     | Const     | `[out_0, out_1, ...]` (D-scaled indices)                                   | 1              |
@@ -250,6 +333,8 @@ impl<F: Field> Circuit<F> {
     pub fn generate_preprocessed_columns<const D: usize>(
         &self,
     ) -> Result<PreprocessedColumns<F, D>, CircuitError> {
+        self.validate_horner_chain_contract()?;
+
         let mut preprocessed = PreprocessedColumns::<F, D>::new();
 
         // Track which witnesses have been defined (first-occurrence = creator).
