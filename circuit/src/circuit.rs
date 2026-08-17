@@ -673,6 +673,141 @@ mod tests {
         );
     }
 
+    // ── The HornerAcc implicit-accumulator chain contract ──────────────────────────────────
+    //
+    // `validate_horner_chain_contract` must be SATISFIABLE (every real emitter passes it — the
+    // whole test suite is that witness) and REFUTABLE in both of the ways an emitter can break
+    // it. A guard that cannot go red is not a guard: the failure it stands for is invisible,
+    // because an unchained Horner step produces the same SHAPE of trace as a chained one and
+    // fails only as an `OodEvaluationMismatch` against the ALU table.
+
+    /// `zero_const, alpha, v0, v1, v2` at witnesses 0..=4; chains write from `first_out`.
+    fn horner_fixture_prefix() -> Vec<Op<F>> {
+        vec![
+            Op::Const {
+                out: WitnessId(0),
+                val: F::ZERO,
+            },
+            Op::Const {
+                out: WitnessId(1),
+                val: F::from_u64(7),
+            },
+            Op::Const {
+                out: WitnessId(2),
+                val: F::from_u64(11),
+            },
+            Op::Const {
+                out: WitnessId(3),
+                val: F::from_u64(13),
+            },
+            Op::Const {
+                out: WitnessId(4),
+                val: F::from_u64(17),
+            },
+        ]
+    }
+
+    #[test]
+    fn horner_chain_contract_accepts_a_well_formed_chain() {
+        let mut ops = horner_fixture_prefix();
+        // out = acc*alpha + c - a, chained: 0 -> 5 -> 6.
+        ops.push(Op::horner_acc(
+            WitnessId(0),
+            WitnessId(1),
+            WitnessId(2),
+            WitnessId(5),
+            WitnessId(0), // seeded at the zero const
+        ));
+        ops.push(Op::horner_acc(
+            WitnessId(0),
+            WitnessId(1),
+            WitnessId(3),
+            WitnessId(6),
+            WitnessId(5), // accumulates from the previous step's out
+        ));
+        let mut circuit = make_circuit(ops);
+        circuit.witness_count = 7;
+        assert!(circuit.generate_preprocessed_columns::<1>().is_ok());
+    }
+
+    #[test]
+    fn horner_chain_contract_refuses_a_nonzero_seed() {
+        let mut ops = horner_fixture_prefix();
+        ops.push(Op::horner_acc(
+            WitnessId(0),
+            WitnessId(1),
+            WitnessId(2),
+            WitnessId(5),
+            WitnessId(4), // NOT the zero const — the separator row cannot supply 17
+        ));
+        let mut circuit = make_circuit(ops);
+        circuit.witness_count = 6;
+        match circuit.generate_preprocessed_columns::<1>() {
+            Err(CircuitError::HornerChainContractViolated { op_index, reason }) => {
+                assert_eq!(op_index, 5);
+                assert!(reason.contains("not a zero constant"), "{reason}");
+            }
+            other => panic!("expected a chain-contract refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn horner_chain_contract_refuses_two_adjacent_independent_chains() {
+        let mut ops = horner_fixture_prefix();
+        // Chain A: one step, seeded at zero.
+        ops.push(Op::horner_acc(
+            WitnessId(0),
+            WitnessId(1),
+            WitnessId(2),
+            WitnessId(5),
+            WitnessId(0),
+        ));
+        // Chain B: also seeded at zero, but IMMEDIATELY adjacent — so the AIR would feed it
+        // chain A's `out` as its accumulator. This is exactly the shape the first draft of the
+        // batched reduced opening emitted (the `R` chain followed by the `Q_1` chain with the
+        // `alpha^n` lookup a cache hit that emitted nothing between them).
+        ops.push(Op::horner_acc(
+            WitnessId(0),
+            WitnessId(1),
+            WitnessId(3),
+            WitnessId(6),
+            WitnessId(0),
+        ));
+        let mut circuit = make_circuit(ops);
+        circuit.witness_count = 7;
+        match circuit.generate_preprocessed_columns::<1>() {
+            Err(CircuitError::HornerChainContractViolated { op_index, reason }) => {
+                assert_eq!(op_index, 6);
+                assert!(reason.contains("back to back"), "{reason}");
+            }
+            other => panic!("expected a chain-contract refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn horner_chain_contract_accepts_two_chains_separated_by_one_op() {
+        let mut ops = horner_fixture_prefix();
+        ops.push(Op::horner_acc(
+            WitnessId(0),
+            WitnessId(1),
+            WitnessId(2),
+            WitnessId(5),
+            WitnessId(0),
+        ));
+        // ONE non-HornerAcc op is all it takes to close the run.
+        ops.push(Op::mul(WitnessId(5), WitnessId(1), WitnessId(6)));
+        ops.push(Op::horner_acc(
+            WitnessId(0),
+            WitnessId(1),
+            WitnessId(3),
+            WitnessId(7),
+            WitnessId(0),
+        ));
+        let mut circuit = make_circuit(ops);
+        circuit.witness_count = 8;
+        assert!(circuit.generate_preprocessed_columns::<1>().is_ok());
+    }
+
     #[test]
     fn test_mixed_operations() {
         // Test covering various operation types and behaviors:
