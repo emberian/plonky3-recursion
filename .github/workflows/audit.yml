@@ -13,6 +13,9 @@ on:
   schedule:
     - cron: '0 6 * * 1'  # weekly, to catch new advisories on unchanged deps
 
+permissions:
+  contents: read
+
 jobs:
   security_audit:
     runs-on: ubuntu-latest

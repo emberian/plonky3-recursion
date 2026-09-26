@@ -10,6 +10,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0 # reduce disk bloat
 
+permissions:
+  contents: read
+
 jobs:
   build_and_test:
     name: Build and Test
@@ -38,6 +41,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           shared-key: ${{ matrix.os }}-${{ matrix.features }}
           cache-on-failure: true
 
@@ -97,6 +101,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           shared-key: recursive-examples
           cache-on-failure: true
 
@@ -140,6 +145,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           shared-key: embedded-${{ env.target }}
           cache-on-failure: true
 
@@ -188,6 +194,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           shared-key: lint
           cache-on-failure: true
 
