@@ -1338,6 +1338,29 @@ where
     Ok((reduced_list, mmcs_op_ids))
 }
 
+/// Refuse a FRI proof whose per-phase folding arities fall outside `1..=max_log_arity`.
+///
+/// The arities are read off the proof being verified, so they must be checked against a
+/// configured bound. The SUM is pinned elsewhere (it determines `log_max_height`); this pins
+/// the PARTITION. `log_arity = 0` is the specific hole: a zero-arity phase consumes no index
+/// bits, so two phases share a folded height and the roll-in lookup can route to the wrong one.
+pub fn check_log_arities(log_arities: &[usize], max_log_arity: usize) -> Result<(), VerificationError> {
+    if max_log_arity == 0 {
+        return Err(VerificationError::InvalidProofShape(
+            "FRI max_log_arity must be at least 1".into(),
+        ));
+    }
+    for (round, &log_arity) in log_arities.iter().enumerate() {
+        if log_arity == 0 || log_arity > max_log_arity {
+            return Err(VerificationError::InvalidProofShape(format!(
+                "FRI round {round}: invalid log-arity {log_arity}: must be in 1..={max_log_arity}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+
 /// Verify FRI arithmetic in-circuit with optional MMCS verification.
 ///
 /// Supports variable-arity FRI folding: each phase may fold by a different arity
@@ -1364,6 +1387,7 @@ pub fn verify_fri_circuit<F, EF, RecMmcs, Inner, Witness, Comm>(
     commitments_with_opening_points: &ComsWithOpeningsTargets<Comm, TwoAdicMultiplicativeCoset<F>>,
     log_blowup: usize,
     expected_num_queries: usize,
+    max_log_arity: usize,
     permutation_config: Option<PermConfig>,
 ) -> Result<Vec<NonPrimitiveOpId>, VerificationError>
 where
@@ -1409,6 +1433,10 @@ where
              expected {expected_num_queries}, got {num_queries}"
         )));
     }
+
+    // Pin every phase's folding arity into `1..=max_log_arity`, as the native
+    // verifier does (`p3_fri::verifier`, "invalid log-arity ... must be in 1..=max").
+    check_log_arities(log_arities, max_log_arity)?;
 
     // Validate shape.
     if num_phases != fri_proof_targets.commit_phase_commits.len() {

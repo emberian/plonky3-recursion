@@ -647,6 +647,7 @@ fn get_recursive_config_and_params() -> (MyConfig, FriVerifierParams, usize, usi
     let fri_verifier_params = FriVerifierParams::unsafe_arithmetic_only_for_tests(
         scalars.log_blowup,
         scalars.log_final_poly_len,
+        scalars.max_log_arity,
         scalars.num_queries,
         scalars.commit_pow_bits,
         scalars.query_pow_bits,

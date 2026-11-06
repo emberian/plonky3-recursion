@@ -28,13 +28,14 @@ type InnerFri = InnerFriGeneric<MyConfig, MyHash, MyCompress, DIGEST_ELEMS>;
 
 const TRACE_D: usize = 1;
 
-fn fri_verifier_params(log_blowup: usize) -> FriVerifierParams {
+fn fri_verifier_params(log_blowup: usize, max_log_arity: usize) -> FriVerifierParams {
     // `num_queries` must be the SAME expression `make_test_config_with_fri` uses
     // (`(100 - query_pow_bits) / log_blowup`) — the verifier pins the proof's
     // query count against it, so a drift here is a refusal, not a silent weakening.
     FriVerifierParams::with_mmcs(
         log_blowup,
         0,
+        max_log_arity,
         (100 - 16) / log_blowup,
         0,
         16,
@@ -102,8 +103,8 @@ fn test_aggregation_with_different_shapes() -> Result<(), VerificationError> {
     circuit_builder.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
 
     // Build the verifier inputs for the Uni-Stark.
-    let left_fri_params = fri_verifier_params(2);
-    let right_fri_params = fri_verifier_params(3);
+    let left_fri_params = fri_verifier_params(2, 3);
+    let right_fri_params = fri_verifier_params(3, 4);
 
     let left_verifier_inputs = StarkVerifierInputsBuilder::<
         MyConfig,

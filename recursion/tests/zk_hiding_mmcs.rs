@@ -151,6 +151,7 @@ fn test_batch_verifier_hiding_mmcs() -> Result<(), VerificationError> {
     let fri_verifier_params = FriVerifierParams::with_mmcs(
         fri_params2.log_blowup,
         fri_params2.log_final_poly_len,
+        fri_params2.max_log_arity,
         fri_params2.num_queries,
         fri_params2.commit_proof_of_work_bits,
         fri_params2.query_proof_of_work_bits,

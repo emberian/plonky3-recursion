@@ -122,6 +122,7 @@ fn ir2_replay_fri_params() -> FriVerifierParams {
     FriVerifierParams::with_mmcs(
         6,
         0,
+        1,
         19,
         0,
         16,

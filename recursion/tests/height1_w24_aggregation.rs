@@ -105,6 +105,7 @@ fn fri_verifier_params() -> FriVerifierParams {
     FriVerifierParams::with_mmcs(
         3,
         0,
+        1,
         38,
         0,
         14,
@@ -138,6 +139,7 @@ fn fri_verifier_params_lb(log_blowup: usize) -> FriVerifierParams {
     FriVerifierParams::with_mmcs(
         log_blowup,
         0,
+        1,
         38,
         0,
         14,

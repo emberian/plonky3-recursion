@@ -771,6 +771,7 @@ where
         let FriVerifierParams {
             log_blowup,
             log_final_poly_len,
+            max_log_arity,
             num_queries: expected_num_queries,
             commit_pow_bits: _,
             query_pow_bits: _,
@@ -792,6 +793,10 @@ where
 
         let alpha = challenges[0];
         let betas = &challenges[1..1 + num_betas];
+
+        // The partition of the total reduction into phases is also attacker-supplied: pin it
+        // before it drives `log_max_height` or the sampling loop.
+        crate::pcs::fri::verifier::check_log_arities(&opening_proof.log_arities, max_log_arity)?;
 
         let total_log_reduction: usize = opening_proof.log_arities.iter().sum();
         let log_max_height = total_log_reduction + log_final_poly_len + log_blowup;
@@ -816,6 +821,7 @@ where
             commitments_with_opening_points,
             log_blowup,
             expected_num_queries,
+            max_log_arity,
             permutation_config,
         )
     }
@@ -1173,6 +1179,7 @@ where
         let FriVerifierParams {
             log_blowup,
             log_final_poly_len,
+            max_log_arity,
             num_queries: expected_num_queries,
             commit_pow_bits: _,
             query_pow_bits: _,
@@ -1193,6 +1200,8 @@ where
 
         let alpha = challenges[0];
         let betas = &challenges[1..1 + num_betas];
+
+        crate::pcs::fri::verifier::check_log_arities(&fri_proof.log_arities, max_log_arity)?;
 
         let total_log_reduction: usize = fri_proof.log_arities.iter().sum();
         let log_max_height = total_log_reduction + log_final_poly_len + log_blowup;
@@ -1222,6 +1231,7 @@ where
             &merged_commitments,
             log_blowup,
             expected_num_queries,
+            max_log_arity,
             permutation_config,
         )
     }

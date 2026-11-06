@@ -457,6 +457,7 @@ macro_rules! define_field_module_types {
             FriVerifierParams::with_mmcs(
                 fp.log_blowup,
                 fp.log_final_poly_len,
+                fp.max_log_arity,
                 (security_level - fp.query_pow_bits) / fp.log_blowup,
                 fp.commit_pow_bits,
                 fp.query_pow_bits,
@@ -730,6 +731,7 @@ macro_rules! define_field_module_types_quintic {
             FriVerifierParams::with_mmcs(
                 fp.log_blowup,
                 fp.log_final_poly_len,
+                fp.max_log_arity,
                 (security_level - fp.query_pow_bits) / fp.log_blowup,
                 fp.commit_pow_bits,
                 fp.query_pow_bits,

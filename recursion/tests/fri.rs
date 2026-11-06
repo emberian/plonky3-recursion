@@ -309,6 +309,8 @@ struct FriSetup {
     /// The CONFIGURED query count, read off `FriParameters`. The verifier pins
     /// the proof's query count against this; it is never derived from a proof.
     num_queries: usize,
+    /// The CONFIGURED largest per-phase log-arity, read off `FriParameters`.
+    max_log_arity: usize,
     query_pow_bits: usize,
     commit_pow_bits: usize,
     group_sizes: Vec<Vec<u8>>,
@@ -322,6 +324,7 @@ impl FriSetup {
         log_blowup: usize,
         log_final_poly_len: usize,
         num_queries: usize,
+        max_log_arity: usize,
         query_pow_bits: usize,
         commit_pow_bits: usize,
         group_sizes: Vec<Vec<u8>>,
@@ -332,6 +335,7 @@ impl FriSetup {
             log_blowup,
             log_final_poly_len,
             num_queries,
+            max_log_arity,
             query_pow_bits,
             commit_pow_bits,
             group_sizes,
@@ -352,6 +356,7 @@ fn generate_setup(log_final_poly_len: usize, group_sizes: Vec<Vec<u8>>) -> FriSe
     let log_blowup = fri_params.log_blowup;
     let log_final_poly_len = fri_params.log_final_poly_len;
     let num_queries = fri_params.num_queries;
+    let max_log_arity = fri_params.max_log_arity;
     let query_pow_bits = fri_params.query_proof_of_work_bits;
     let commit_pow_bits = fri_params.commit_proof_of_work_bits;
     let pcs = MyPcs::new(dft, val_mmcs, fri_params);
@@ -362,6 +367,7 @@ fn generate_setup(log_final_poly_len: usize, group_sizes: Vec<Vec<u8>>) -> FriSe
         log_blowup,
         log_final_poly_len,
         num_queries,
+        max_log_arity,
         query_pow_bits,
         commit_pow_bits,
         group_sizes,
@@ -375,6 +381,7 @@ fn run_fri_test(setup: FriSetup, build_only: bool) {
         log_blowup,
         log_final_poly_len,
         num_queries: configured_num_queries,
+        max_log_arity,
         query_pow_bits,
         commit_pow_bits,
         group_sizes,
@@ -469,6 +476,7 @@ fn run_fri_test(setup: FriSetup, build_only: bool) {
             &commitments_with_opening_points_targets,
             log_blowup,
             configured_num_queries,
+            max_log_arity,
             None, // MMCS verification disabled
         )
         .unwrap();
@@ -563,6 +571,7 @@ fn run_fri_test_with_mmcs(setup: FriSetup) {
         log_blowup,
         log_final_poly_len,
         num_queries: configured_num_queries,
+        max_log_arity,
         query_pow_bits,
         commit_pow_bits,
         group_sizes,
@@ -677,6 +686,7 @@ fn run_fri_test_with_mmcs(setup: FriSetup) {
         &commitments_with_opening_points_targets,
         log_blowup,
         configured_num_queries,
+        max_log_arity,
         Some(Poseidon2Config::BABY_BEAR_D4_W16.into()),
     )
     .unwrap();
@@ -814,6 +824,7 @@ fn try_build_fri_verifier(
     result: &ProduceInputsResult,
     log_blowup: usize,
     expected_num_queries: usize,
+    max_log_arity: usize,
 ) -> Result<(), VerificationError> {
     let num_phases = result.num_phases;
     let log_max_height = result.log_max_height;
@@ -857,6 +868,7 @@ fn try_build_fri_verifier(
         &commitments_with_opening_points_targets,
         log_blowup,
         expected_num_queries,
+        max_log_arity,
         None, // MMCS verification disabled; we only exercise shape validation.
     )
     .map(|_| ())
@@ -884,7 +896,7 @@ fn test_fri_verifier_rejects_per_query_schedule_mismatch() {
     );
 
     // Sanity: the untampered proof passes shape validation.
-    try_build_fri_verifier(&result, setup.log_blowup, setup.num_queries)
+    try_build_fri_verifier(&result, setup.log_blowup, setup.num_queries, setup.max_log_arity)
         .expect("untampered FRI proof must pass shape validation");
 
     // --- Case 1: a non-first query's `log_arity` diverges from the global schedule
@@ -904,7 +916,7 @@ fn test_fri_verifier_rejects_per_query_schedule_mismatch() {
         // second query no longer matches query 0's schedule.
         step.log_arity += 1;
     }
-    let err = try_build_fri_verifier(&tampered, setup.log_blowup, setup.num_queries)
+    let err = try_build_fri_verifier(&tampered, setup.log_blowup, setup.num_queries, setup.max_log_arity)
         .expect_err("per-query log_arity divergence must be rejected");
     assert!(
         matches!(err, VerificationError::InvalidProofShape(_)),
@@ -914,7 +926,7 @@ fn test_fri_verifier_rejects_per_query_schedule_mismatch() {
     // --- Case 2: a non-first query drops a commit-phase opening, so its
     // opening count no longer matches the number of phases.
     result.fri_proof.query_proofs[1].commit_phase_openings.pop();
-    let err = try_build_fri_verifier(&result, setup.log_blowup, setup.num_queries)
+    let err = try_build_fri_verifier(&result, setup.log_blowup, setup.num_queries, setup.max_log_arity)
         .expect_err("per-query commit-phase opening count mismatch must be rejected");
     assert!(
         matches!(err, VerificationError::InvalidProofShape(_)),
@@ -951,7 +963,7 @@ fn test_fri_verifier_rejects_zero_query_proof() {
     // dedicated zero-query refusal rather than being short-circuited by the
     // configured-count pin (which fires first and would otherwise make this test
     // stop testing what it names).
-    let err = try_build_fri_verifier(&result, setup.log_blowup, 0)
+    let err = try_build_fri_verifier(&result, setup.log_blowup, 0, setup.max_log_arity)
         .expect_err("zero-query FRI proof must be rejected, not panic");
     let VerificationError::InvalidProofShape(msg) = &err else {
         panic!("expected InvalidProofShape, got {err:?}");
@@ -1006,7 +1018,7 @@ fn test_fri_verifier_pins_query_count_against_config() {
     );
 
     // Positive control: at the configured count the verifier accepts.
-    try_build_fri_verifier(&honest, setup.log_blowup, configured)
+    try_build_fri_verifier(&honest, setup.log_blowup, configured, setup.max_log_arity)
         .expect("an honest proof at the configured query count must pass shape validation");
 
     // --- Case 1: the attack. Mint a proof with FEWER queries than configured.
@@ -1042,7 +1054,7 @@ fn test_fri_verifier_pins_query_count_against_config() {
          be diagnosing the index-bit shape rather than the query count"
     );
 
-    let err = try_build_fri_verifier(&weakened, setup.log_blowup, configured)
+    let err = try_build_fri_verifier(&weakened, setup.log_blowup, configured, setup.max_log_arity)
         .expect_err("a proof with fewer queries than configured must be REFUSED");
     let VerificationError::InvalidProofShape(msg) = &err else {
         panic!("expected InvalidProofShape, got {err:?}");
@@ -1076,7 +1088,7 @@ fn test_fri_verifier_pins_query_count_against_config() {
         "the inflation mutation must actually have added a query proof"
     );
 
-    let err = try_build_fri_verifier(&inflated, setup.log_blowup, configured)
+    let err = try_build_fri_verifier(&inflated, setup.log_blowup, configured, setup.max_log_arity)
         .expect_err("a proof with more queries than configured must be REFUSED");
     let VerificationError::InvalidProofShape(msg) = &err else {
         panic!("expected InvalidProofShape, got {err:?}");
@@ -1085,4 +1097,66 @@ fn test_fri_verifier_pins_query_count_against_config() {
         msg.contains("configured number of queries"),
         "the refusal must name the query-count pin, got: {msg}"
     );
+}
+
+/// **The per-phase folding arity is a soundness parameter and must be bounded by the config.**
+///
+/// The recursive verifier reads each phase's `log_arity` off the proof. The SUM is pinned
+/// transitively (it fixes `log_max_height`), but the PARTITION was attacker-chosen and
+/// `log_arity = 0` was unrejected. The native verifier refuses both cases ("invalid log-arity ...
+/// must be in 1..=max"); this mirrors it.
+///
+/// Constructive: each case tampers EVERY query's schedule consistently, so the per-query schedule
+/// check (which compares queries to query 0) cannot fire first. Each case asserts the tamper
+/// happened and that the refusal is the arity refusal by message, so this test cannot drift into
+/// testing a different check.
+#[test]
+fn test_fri_verifier_pins_log_arity_against_config() {
+    let setup = generate_setup(
+        0,
+        vec![vec![0u8, 5, 8, 8, 10], vec![8u8, 11], vec![4u8, 5, 8]],
+    );
+    assert_eq!(setup.max_log_arity, 1, "the testing schedule is arity 2");
+    let honest = produce_inputs_multi(
+        &setup.pcs,
+        &setup.perm,
+        setup.log_blowup,
+        setup.log_final_poly_len,
+        (setup.commit_pow_bits, setup.query_pow_bits),
+        &setup.group_sizes,
+        0,
+    );
+    try_build_fri_verifier(&honest, setup.log_blowup, setup.num_queries, setup.max_log_arity)
+        .expect("an honest proof must pass at the configured max_log_arity");
+
+    for (bad, label) in [(0u8, "zero"), (2u8, "above max")] {
+        let mut t = produce_inputs_multi(
+            &setup.pcs,
+            &setup.perm,
+            setup.log_blowup,
+            setup.log_final_poly_len,
+            (setup.commit_pow_bits, setup.query_pow_bits),
+            &setup.group_sizes,
+            0,
+        );
+        for q in &mut t.fri_proof.query_proofs {
+            q.commit_phase_openings[0].log_arity = bad;
+        }
+        assert!(
+            t.fri_proof
+                .query_proofs
+                .iter()
+                .all(|q| q.commit_phase_openings[0].log_arity == bad),
+            "the tamper must have happened"
+        );
+        let err = try_build_fri_verifier(&t, setup.log_blowup, setup.num_queries, setup.max_log_arity)
+            .expect_err("a phase arity outside 1..=max_log_arity must be refused");
+        let VerificationError::InvalidProofShape(msg) = &err else {
+            panic!("expected InvalidProofShape, got {err:?}");
+        };
+        assert!(
+            msg.contains("invalid log-arity"),
+            "case {label}: must trip the arity pin, got: {msg}"
+        );
+    }
 }

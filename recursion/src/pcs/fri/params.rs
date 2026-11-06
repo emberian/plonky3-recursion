@@ -10,6 +10,17 @@ pub struct FriVerifierParams {
     pub log_blowup: usize,
     /// Log₂ of the final polynomial length (after all folding rounds)
     pub log_final_poly_len: usize,
+    /// Largest per-phase folding arity (log2) the verifier accepts.
+    ///
+    /// Also a **soundness parameter**. The native verifier enforces
+    /// `1 <= log_arity <= max_log_arity` per commit phase
+    /// (`p3_fri::verifier::verify_fri` -> `FriError::InvalidProofShape`). Before this
+    /// field existed the recursive verifier read each phase's arity off the proof:
+    /// the SUM was pinned transitively (it fixes `log_max_height`), but the
+    /// PARTITION was attacker-chosen and `log_arity = 0` was unrejected. A
+    /// zero-arity phase leaves the cumulative index bits unadvanced, so the
+    /// folded height repeats and the roll-in lookup can route to the wrong phase.
+    pub max_log_arity: usize,
     /// Number of FRI query proofs the verifier requires.
     ///
     /// This is a **soundness parameter**, not a shape hint: FRI query soundness is
@@ -36,6 +47,7 @@ impl FriVerifierParams {
     pub fn with_mmcs(
         log_blowup: usize,
         log_final_poly_len: usize,
+        max_log_arity: usize,
         num_queries: usize,
         commit_pow_bits: usize,
         query_pow_bits: usize,
@@ -44,6 +56,7 @@ impl FriVerifierParams {
         Self {
             log_blowup,
             log_final_poly_len,
+            max_log_arity,
             num_queries,
             commit_pow_bits,
             query_pow_bits,
@@ -69,6 +82,7 @@ impl FriVerifierParams {
     pub const fn unsafe_arithmetic_only_for_tests(
         log_blowup: usize,
         log_final_poly_len: usize,
+        max_log_arity: usize,
         num_queries: usize,
         commit_pow_bits: usize,
         query_pow_bits: usize,
@@ -76,6 +90,7 @@ impl FriVerifierParams {
         Self {
             log_blowup,
             log_final_poly_len,
+            max_log_arity,
             num_queries,
             commit_pow_bits,
             query_pow_bits,
@@ -99,7 +114,7 @@ mod tests {
     /// checks.
     #[test]
     fn with_mmcs_always_enables_mmcs_verification() {
-        let params = FriVerifierParams::with_mmcs(1, 0, 2, 0, 0, p2());
+        let params = FriVerifierParams::with_mmcs(1, 0, 1, 2, 0, 0, p2());
         assert!(
             params.permutation_config.is_some(),
             "with_mmcs must enable MMCS verification"
@@ -110,7 +125,7 @@ mod tests {
     /// test-only constructor — there is no implicit (`From`/`into`) path.
     #[test]
     fn arithmetic_only_is_the_only_way_to_disable_mmcs() {
-        let params = FriVerifierParams::unsafe_arithmetic_only_for_tests(1, 0, 2, 0, 0);
+        let params = FriVerifierParams::unsafe_arithmetic_only_for_tests(1, 0, 1, 2, 0, 0);
         assert!(
             params.permutation_config.is_none(),
             "arithmetic-only params must not perform MMCS verification"

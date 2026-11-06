@@ -137,6 +137,7 @@ fn child_verifier_fingerprint(n: usize, min_trace_height: usize) -> Fingerprint 
     let fri_verifier_params = FriVerifierParams::with_mmcs(
         scalars.log_blowup,
         scalars.log_final_poly_len,
+        scalars.max_log_arity,
         scalars.num_queries,
         scalars.commit_pow_bits,
         scalars.query_pow_bits,
@@ -343,6 +344,7 @@ fn child_verifier_fingerprint_manifest(
     let fri_verifier_params = FriVerifierParams::with_mmcs(
         scalars.log_blowup,
         scalars.log_final_poly_len,
+        scalars.max_log_arity,
         scalars.num_queries,
         scalars.commit_pow_bits,
         scalars.query_pow_bits,
@@ -657,6 +659,7 @@ fn d4_verifier_fingerprint(
     let fri_verifier_params = FriVerifierParams::with_mmcs(
         scalars.log_blowup,
         scalars.log_final_poly_len,
+        scalars.max_log_arity,
         scalars.num_queries,
         scalars.commit_pow_bits,
         scalars.query_pow_bits,
